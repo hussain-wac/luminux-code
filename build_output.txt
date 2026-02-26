@@ -1,0 +1,134 @@
+   Compiling luminex-ui v0.1.0 (C:\Users\l7cre\Desktop\luminux-code\crates\luminex-ui)
+error[E0433]: failed to resolve: could not find `unix` in `os`
+    --> crates\luminex-ui\src\app.rs:1820:22
+     |
+1820 |         use std::os::unix::io::AsRawFd;
+     |                      ^^^^ could not find `unix` in `os`
+     |
+note: found an item that was configured out
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf\library\std\src\os\mod.rs:29:5
+     |
+     = note: the item is gated here
+note: found an item that was configured out
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf\library\std\src\os\mod.rs:84:41
+     |
+     = note: the item is gated here
+
+error[E0432]: unresolved import `nix::pty`
+    --> crates\luminex-ui\src\app.rs:1819:18
+     |
+1819 |         use nix::pty::openpty;
+     |                  ^^^ could not find `pty` in `nix`
+
+error[E0425]: cannot find function `fork` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1828:34
+     |
+1828 |         let pid = unsafe { libc::fork() };
+     |                                  ^^^^ not found in `libc`
+
+error[E0425]: cannot find function `setsid` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1837:23
+     |
+1837 |                 libc::setsid();
+     |                       ^^^^^^ help: a function with a similar name exists: `getpid`
+     |
+    ::: C:\Users\l7cre\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\libc-0.2.182\src\windows\mod.rs:504:5
+     |
+ 504 |     pub fn getpid() -> c_int;
+     |     ------------------------- similarly named function `getpid` defined here
+
+error[E0425]: cannot find function `ioctl` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1840:23
+     |
+1840 |                 libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+     |                       ^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `TIOCSCTTY` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1840:45
+     |
+1840 |                 libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+     |                                             ^^^^^^^^^ not found in `libc`
+
+error[E0422]: cannot find struct, variant or union type `winsize` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1865:32
+     |
+1865 |                 let ws = libc::winsize {
+     |                                ^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find function `ioctl` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1871:23
+     |
+1871 |                 libc::ioctl(0, libc::TIOCSWINSZ, &ws);
+     |                       ^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `TIOCSWINSZ` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1871:38
+     |
+1871 |                 libc::ioctl(0, libc::TIOCSWINSZ, &ws);
+     |                                      ^^^^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find function `fcntl` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1892:31
+     |
+1892 |             let flags = libc::fcntl(master_fd, libc::F_GETFL);
+     |                               ^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `F_GETFL` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1892:54
+     |
+1892 |             let flags = libc::fcntl(master_fd, libc::F_GETFL);
+     |                                                      ^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find function `fcntl` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1893:19
+     |
+1893 |             libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+     |                   ^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `F_SETFL` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1893:42
+     |
+1893 |             libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+     |                                          ^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `O_NONBLOCK` in crate `libc`
+    --> crates\luminex-ui\src\app.rs:1893:65
+     |
+1893 |             libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+     |                                                                 ^^^^^^^^^^ not found in `libc`
+
+error[E0308]: mismatched types
+    --> crates\luminex-ui\src\app.rs:1576:83
+     |
+1576 | ...                   libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+     |                       ---------- arguments to this function are incorrect   ^^^^^^^^^ expected `u32`, found `usize`
+     |
+note: function defined here
+    --> C:\Users\l7cre\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\libc-0.2.182\src\windows\mod.rs:514:12
+     |
+ 514 |     pub fn read(fd: c_int, buf: *mut c_void, count: c_uint) -> c_int;
+     |            ^^^^
+help: you can convert a `usize` to a `u32` and panic if the converted value doesn't fit
+     |
+1576 |                             libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len().try_into().unwrap())
+     |                                                                                            ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates\luminex-ui\src\app.rs:1775:71
+     |
+1775 |                 libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+     |                 ----------- arguments to this function are incorrect  ^^^^^^^^^^ expected `u32`, found `usize`
+     |
+note: function defined here
+    --> C:\Users\l7cre\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\libc-0.2.182\src\windows\mod.rs:520:12
+     |
+ 520 |     pub fn write(fd: c_int, buf: *const c_void, count: c_uint) -> c_int;
+     |            ^^^^^
+help: you can convert a `usize` to a `u32` and panic if the converted value doesn't fit
+     |
+1775 |                 libc::write(fd, data.as_ptr() as *const libc::c_void, data.len().try_into().unwrap());
+     |                                                                                 ++++++++++++++++++++
+
+Some errors have detailed explanations: E0308, E0422, E0425, E0432, E0433.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `luminex-ui` (lib) due to 16 previous errors

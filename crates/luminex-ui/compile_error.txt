@@ -1,0 +1,51 @@
+    Checking luminex-ui v0.1.0 (C:\Users\l7cre\Desktop\luminux-code\crates\luminex-ui)
+error[E0599]: no variant or associated item named `CommandReceived` found for enum `iced_term::Event` in the current scope
+    --> crates\luminex-ui\src\app.rs:1510:54
+     |
+1510 |             Message::TerminalEvent(iced_term::Event::CommandReceived(_, cmd)) => {
+     |                                                      ^^^^^^^^^^^^^^^ variant or associated item not found in `iced_term::Event`
+
+error[E0599]: no method named `update` found for struct `Terminal` in the current scope
+    --> crates\luminex-ui\src\app.rs:1511:37
+     |
+1511 |                 match self.terminal.update(iced_term::Command::ProcessBackendCommand(cmd)) {
+     |                                     ^^^^^^ method not found in `Terminal`
+
+error[E0599]: no variant or associated item named `ProcessBackendCommand` found for enum `iced_term::Command` in the current scope
+    --> crates\luminex-ui\src\app.rs:1511:64
+     |
+1511 |                 match self.terminal.update(iced_term::Command::ProcessBackendCommand(cmd)) {
+     |                                                                ^^^^^^^^^^^^^^^^^^^^^ variant or associated item not found in `iced_term::Command`
+
+error[E0308]: mismatched types
+    --> crates\luminex-ui\src\app.rs:1667:37
+     |
+1667 |             iced::Subscription::run(|| self.terminal.subscription()).map(Message::TerminalEvent),
+     |             ----------------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected fn pointer, found closure
+     |             |
+     |             arguments to this function are incorrect
+     |
+    ::: C:\Users\l7cre\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\iced_term-0.6.0\src\terminal.rs:63:35
+     |
+  63 |     pub fn subscription(&self) -> impl Stream<Item = Event> {
+     |                                   -------------------------
+     |                                   |
+     |                                   the expected opaque type
+     |                                   the found opaque type
+     |
+     = note: expected fn pointer `fn() -> impl Stream<Item = iced_term::Event>`
+                   found closure `{closure@crates\luminex-ui\src\app.rs:1667:37: 1667:39}`
+note: closures can only be coerced to `fn` types if they do not capture any variables
+    --> crates\luminex-ui\src\app.rs:1667:40
+     |
+1667 |             iced::Subscription::run(|| self.terminal.subscription()).map(Message::TerminalEvent),
+     |                                        ^^^^ `self` captured here
+note: associated function defined here
+    --> C:\Users\l7cre\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\iced_futures-0.13.2\src\subscription.rs:178:12
+     |
+ 178 |     pub fn run<S>(builder: fn() -> S) -> Self
+     |            ^^^
+
+Some errors have detailed explanations: E0308, E0599.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `luminex-ui` (lib) due to 4 previous errors

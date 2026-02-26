@@ -326,18 +326,12 @@ pub struct App {
     diagnostics_messages: Vec<String>,
     /// Whether the integrated terminal is visible.
     terminal_visible: bool,
-    /// Terminal output lines.
-    terminal_output: Vec<String>,
     /// Terminal height in pixels.
     terminal_height: f32,
-    /// PTY master file descriptor (raw fd) for writing to the shell. -1 means not spawned.
-    terminal_pty_fd: i32,
-    /// Whether the PTY shell has been spawned.
-    terminal_spawned: bool,
-    /// Whether the terminal panel has keyboard focus (keys go to PTY).
+    /// Whether the terminal has focus
     terminal_focused: bool,
-    /// Editor scroll offset in lines (tracked from EditorAction::Scroll).
-    editor_scroll_offset: f32,
+    /// The native iced_term terminal emulator instance.
+    terminal: iced_term::Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,15 +451,9 @@ pub enum Message {
     HideAbout,
 
     // Terminal
-    TerminalOutput(String),
+    TerminalEvent(iced_term::Event),
     TerminalClear,
-    TerminalSpawned(i32),
-    TerminalTick,
     TerminalFocused,
-    TerminalUnfocused,
-    /// Raw key input to send to PTY (character bytes).
-    TerminalKeyInput(String),
-    /// Raw key press event for routing (terminal vs editor).
     KeyPressed(keyboard::Key, keyboard::Modifiers),
 
     // Async results
@@ -509,12 +497,16 @@ impl App {
             diagnostics_visible: false,
             diagnostics_messages: Vec::new(),
             terminal_visible: false,
-            terminal_output: Vec::new(),
             terminal_height: 250.0,
-            terminal_pty_fd: -1,
-            terminal_spawned: false,
             terminal_focused: false,
-            editor_scroll_offset: 0.0,
+            terminal: iced_term::Terminal::new(0, iced_term::settings::Settings {
+                backend: iced_term::settings::BackendSettings {
+                    program: if cfg!(windows) { "powershell.exe".to_string() } else { std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()) },
+                    args: vec![],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }).expect("failed to create the new terminal instance"),
         };
 
         // Set initial content with sample Rust code
@@ -782,10 +774,7 @@ impl Config {
                 self.active_menu = None;
                 self.terminal_focused = false;
 
-                // Track scroll offset for scrollbar
-                if let text_editor::Action::Scroll { lines } = &action {
-                    self.editor_scroll_offset = (self.editor_scroll_offset + *lines as f32).max(0.0);
-                }
+                // Scroll tracked via iced scrollable natively
 
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let is_edit = action.is_edit();
@@ -801,9 +790,7 @@ impl Config {
                         tab.modified = true;
                     }
 
-                    // Clamp scroll offset to valid range
-                    let max_scroll = (tab.content.line_count() as f32 - 1.0).max(0.0);
-                    self.editor_scroll_offset = self.editor_scroll_offset.clamp(0.0, max_scroll);
+                    // Scroll is automatically handled by scrollable
                 }
             }
 
@@ -813,7 +800,6 @@ impl Config {
                 self.active_menu = None;
                 if idx < self.tabs.len() {
                     self.active_tab = idx;
-                    self.editor_scroll_offset = 0.0;
                     let name = self.tabs[idx].name.clone();
                     self.status_message = format!("Editing: {}", name);
                 }
@@ -1395,18 +1381,6 @@ impl Config {
                 self.terminal_visible = !self.terminal_visible;
                 self.diagnostics_visible = false;
                 if self.terminal_visible {
-                    if !self.terminal_spawned {
-                        match Self::spawn_pty_shell(self.current_folder.as_deref()) {
-                            Ok(master_fd) => {
-                                self.terminal_pty_fd = master_fd;
-                                self.terminal_spawned = true;
-                                self.terminal_output.clear();
-                            }
-                            Err(e) => {
-                                self.terminal_output.push(format!("Failed to spawn terminal: {}", e));
-                            }
-                        }
-                    }
                     self.terminal_focused = true;
                     self.status_message = "Bottom dock shown".to_string();
                 } else {
@@ -1457,23 +1431,8 @@ impl Config {
                 self.terminal_visible = !self.terminal_visible;
                 if self.terminal_visible {
                     self.diagnostics_visible = false;
-                    // Spawn PTY shell if not already spawned
-                    if !self.terminal_spawned {
-                        match Self::spawn_pty_shell(self.current_folder.as_deref()) {
-                            Ok(master_fd) => {
-                                self.terminal_pty_fd = master_fd;
-                                self.terminal_spawned = true;
-                                self.terminal_output.clear();
-                            }
-                            Err(e) => {
-                                self.terminal_output.push(format!("Failed to spawn terminal: {}", e));
-                            }
-                        }
-                    }
-                    self.terminal_focused = true;
                     self.status_message = "Terminal panel shown".to_string();
                 } else {
-                    self.terminal_focused = false;
                     self.status_message = "Terminal panel hidden".to_string();
                 }
             }
@@ -1548,73 +1507,23 @@ impl Config {
             }
 
             // Terminal
-            Message::TerminalOutput(output) => {
-                if !output.is_empty() {
-                    self.terminal_output.push(output);
-                    // Limit buffer
-                    if self.terminal_output.len() > 5000 {
-                        let drain_count = self.terminal_output.len() - 5000;
-                        self.terminal_output.drain(0..drain_count);
+            Message::TerminalEvent(event) => {
+                match event {
+                    iced_term::Event::BackendCall(_, cmd) => {
+                        match self.terminal.handle(iced_term::Command::ProxyToBackend(cmd)) {
+                            iced_term::actions::Action::Shutdown => {
+                                // Handle shutdown if necessary
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
             Message::TerminalClear => {
-                self.terminal_output.clear();
-            }
-            Message::TerminalSpawned(fd) => {
-                self.terminal_pty_fd = fd;
-                self.terminal_spawned = true;
-            }
-            Message::TerminalTick => {
-                // Read available data from PTY master
-                if self.terminal_pty_fd >= 0 {
-                    let fd = self.terminal_pty_fd;
-                    let mut buf = [0u8; 8192];
-                    let mut got_data = false;
-                    loop {
-                        let n = unsafe {
-                            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                        };
-                        if n > 0 {
-                            got_data = true;
-                            let raw = String::from_utf8_lossy(&buf[..n as usize]).to_string();
-                            let cleaned = Self::strip_ansi(&raw);
-
-                            // Split into lines, appending to the last incomplete line
-                            let lines: Vec<&str> = cleaned.split('\n').collect();
-                            if let Some(first) = lines.first() {
-                                // Append to last line if it exists (continuation of incomplete line)
-                                if let Some(last_line) = self.terminal_output.last_mut() {
-                                    last_line.push_str(first);
-                                } else {
-                                    self.terminal_output.push(first.to_string());
-                                }
-                                // Remaining lines are new complete lines
-                                for line in &lines[1..] {
-                                    self.terminal_output.push(line.to_string());
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    if got_data {
-                        // Limit buffer to 5000 lines
-                        if self.terminal_output.len() > 5000 {
-                            let drain_count = self.terminal_output.len() - 5000;
-                            self.terminal_output.drain(0..drain_count);
-                        }
-                    }
-                }
+                // Not supported currently without backend proxy override
             }
             Message::TerminalFocused => {
                 self.terminal_focused = true;
-            }
-            Message::TerminalUnfocused => {
-                self.terminal_focused = false;
-            }
-            Message::TerminalKeyInput(data) => {
-                self.pty_write(data.as_bytes());
             }
 
             Message::KeyPressed(key, modifiers) => {
@@ -1665,116 +1574,54 @@ impl Config {
                         "q" => return self.update(Message::CloseWindow),
                         _ => {}
                     }
-
-                    if self.terminal_focused {
-                        // Send Ctrl+key as control character to PTY
-                        let ctrl_char = match c.as_str() {
-                            "c" => Some("\x03"),
-                            "d" => Some("\x04"),
-                            "z" => Some("\x1a"),
-                            "l" => Some("\x0c"),
-                            "a" => Some("\x01"),
-                            "e" => Some("\x05"),
-                            "u" => Some("\x15"),
-                            "k" => Some("\x0b"),
-                            "w" => Some("\x17"),
-                            "r" => Some("\x12"),
-                            "p" => Some("\x10"),
-                            "n" => Some("\x0e"),
-                            _ => None,
-                        };
-                        if let Some(ch) = ctrl_char {
-                            self.pty_write(ch.as_bytes());
-                        }
-                    } else {
-                        // Editor shortcuts
-                        match c.as_str() {
-                            "a" => return self.update(Message::EditorSelectAll),
-                            "n" => return self.update(Message::NewFile),
-                            "o" => return self.update(Message::OpenFile),
-                            "s" => return self.update(Message::Save),
-                            "w" => return self.update(Message::CloseCurrentTab),
-                            "z" => return self.update(Message::Undo),
-                            "y" => return self.update(Message::Redo),
-                            "g" => return self.update(Message::ShowGotoLine),
-                            "=" | "+" => return self.update(Message::ZoomIn),
-                            "-" => return self.update(Message::ZoomOut),
-                            "0" => return self.update(Message::ZoomReset),
-                            "b" => return self.update(Message::ToggleLeftDock),
-                            _ => {}
-                        }
+                    // Editor shortcuts
+                    match c.as_str() {
+                        "a" => return self.update(Message::EditorSelectAll),
+                        "n" => return self.update(Message::NewFile),
+                        "o" => return self.update(Message::OpenFile),
+                        "s" => return self.update(Message::Save),
+                        "w" => return self.update(Message::CloseCurrentTab),
+                        "z" => return self.update(Message::Undo),
+                        "y" => return self.update(Message::Redo),
+                        "g" => return self.update(Message::ShowGotoLine),
+                        "=" | "+" => return self.update(Message::ZoomIn),
+                        "-" => return self.update(Message::ZoomOut),
+                        "0" => return self.update(Message::ZoomReset),
+                        "b" => return self.update(Message::ToggleLeftDock),
+                        _ => {}
                     }
                 }
             }
 
-            // Ctrl+Tab switching (only when not in terminal)
-            if !self.terminal_focused {
-                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
-                    if modifiers.shift() {
-                        return self.update(Message::PrevTab);
-                    } else {
-                        return self.update(Message::NextTab);
-                    }
-                }
-            } else {
-                // Ctrl+Tab in terminal: send tab to PTY
-                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
-                    self.pty_write(b"\t");
+            // Ctrl+Tab switching
+            if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
+                if modifiers.shift() {
+                    return self.update(Message::PrevTab);
+                } else {
+                    return self.update(Message::NextTab);
                 }
             }
 
             return Task::none();
-        }
-
-        // --- Non-Ctrl keys ---
-        if self.terminal_focused {
-            match &key {
-                keyboard::Key::Character(c) => {
-                    self.pty_write(c.as_bytes());
-                }
-                keyboard::Key::Named(named) => {
-                    let seq = match named {
-                        keyboard::key::Named::Enter => Some("\n"),
-                        keyboard::key::Named::Backspace => Some("\x7f"),
-                        keyboard::key::Named::Tab => Some("\t"),
-                        keyboard::key::Named::Escape => Some("\x1b"),
-                        keyboard::key::Named::ArrowUp => Some("\x1b[A"),
-                        keyboard::key::Named::ArrowDown => Some("\x1b[B"),
-                        keyboard::key::Named::ArrowRight => Some("\x1b[C"),
-                        keyboard::key::Named::ArrowLeft => Some("\x1b[D"),
-                        keyboard::key::Named::Home => Some("\x1b[H"),
-                        keyboard::key::Named::End => Some("\x1b[F"),
-                        keyboard::key::Named::Delete => Some("\x1b[3~"),
-                        keyboard::key::Named::PageUp => Some("\x1b[5~"),
-                        keyboard::key::Named::PageDown => Some("\x1b[6~"),
-                        keyboard::key::Named::Space => Some(" "),
-                        _ => None,
-                    };
-                    if let Some(s) = seq {
-                        self.pty_write(s.as_bytes());
-                    }
-                }
-                _ => {}
-            }
-            return Task::none();
-        }
-
-        // Escape to close modals/menus (when terminal not focused)
-        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-            return self.update(Message::CloseTopMenu);
         }
 
         Task::none()
     }
 
-    /// Write raw bytes to the PTY master fd.
-    fn pty_write(&self, data: &[u8]) {
-        if self.terminal_pty_fd >= 0 {
-            let fd = self.terminal_pty_fd;
-            unsafe {
-                libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+    fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if ty.is_dir() {
+                Self::copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                std::fs::copy(&src_path, &dst_path)?;
             }
         }
+        Ok(())
     }
 
     fn refresh_file_tree(&mut self) {
@@ -1814,170 +1661,18 @@ impl Config {
         }
     }
 
-    /// Spawn a PTY shell process (bash or sh). Returns the master fd on success.
-    fn spawn_pty_shell(cwd: Option<&Path>) -> Result<i32, String> {
-        use nix::pty::openpty;
-        use std::os::unix::io::AsRawFd;
-
-        // Open a PTY pair
-        let pty = openpty(None, None).map_err(|e| format!("openpty failed: {}", e))?;
-        let master_fd = pty.master.as_raw_fd();
-        let slave_fd = pty.slave.as_raw_fd();
-
-        // Fork
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err("fork failed".to_string());
-        }
-
-        if pid == 0 {
-            // Child process
-            unsafe {
-                // Create a new session
-                libc::setsid();
-
-                // Set the slave as the controlling terminal
-                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
-
-                // Redirect stdin/stdout/stderr to slave
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
-
-                // Close the master and original slave fds
-                libc::close(master_fd);
-                if slave_fd > 2 {
-                    libc::close(slave_fd);
-                }
-
-                // Set working directory
-                if let Some(dir) = cwd {
-                    if let Ok(dir_cstr) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
-                        libc::chdir(dir_cstr.as_ptr());
-                    }
-                }
-
-                // Set environment variables
-                let term = std::ffi::CString::new("TERM=xterm-256color").unwrap();
-                libc::putenv(term.as_ptr() as *mut _);
-
-                // Set terminal size (rows=24, cols=120)
-                let ws = libc::winsize {
-                    ws_row: 24,
-                    ws_col: 120,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-                libc::ioctl(0, libc::TIOCSWINSZ, &ws);
-
-                // Execute shell
-                let shell = std::ffi::CString::new("/bin/bash").unwrap();
-                let arg0 = std::ffi::CString::new("bash").unwrap();
-                let args = [arg0.as_ptr(), std::ptr::null()];
-                libc::execvp(shell.as_ptr(), args.as_ptr());
-
-                // If bash fails, try sh
-                let shell = std::ffi::CString::new("/bin/sh").unwrap();
-                let arg0 = std::ffi::CString::new("sh").unwrap();
-                let args = [arg0.as_ptr(), std::ptr::null()];
-                libc::execvp(shell.as_ptr(), args.as_ptr());
-
-                libc::_exit(1);
-            }
-        }
-
-        // Parent process: close the slave fd, set master to non-blocking
-        unsafe {
-            libc::close(slave_fd);
-            let flags = libc::fcntl(master_fd, libc::F_GETFL);
-            libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        // Leak the OwnedFd so it doesn't close when dropped
-        std::mem::forget(pty.master);
-        std::mem::forget(pty.slave);
-
-        Ok(master_fd)
-    }
-
-    /// Strip ANSI escape sequences from terminal output.
-    fn strip_ansi(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                // ESC sequence - skip until we find the terminator
-                if let Some(&next) = chars.peek() {
-                    if next == '[' {
-                        chars.next(); // consume '['
-                        // CSI sequence: skip until we find a letter (0x40-0x7E)
-                        while let Some(&ch) = chars.peek() {
-                            chars.next();
-                            if ch.is_ascii_alphabetic() || ch == '~' || ch == '@' {
-                                break;
-                            }
-                        }
-                    } else if next == ']' {
-                        chars.next(); // consume ']'
-                        // OSC sequence: skip until BEL or ST
-                        while let Some(&ch) = chars.peek() {
-                            chars.next();
-                            if ch == '\x07' {
-                                break;
-                            }
-                            if ch == '\x1b' {
-                                if let Some(&'\\') = chars.peek() {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                        }
-                    } else if next == '(' || next == ')' {
-                        chars.next(); // consume '(' or ')'
-                        chars.next(); // consume charset designator
-                    } else {
-                        chars.next(); // consume single char after ESC
-                    }
-                }
-            } else if c == '\r' {
-                // Skip carriage returns
-            } else {
-                result.push(c);
-            }
-        }
-        result
-    }
-
-    fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            if ty.is_dir() {
-                Self::copy_dir_recursive(&src_path, &dst_path)?;
-            } else {
-                std::fs::copy(&src_path, &dst_path)?;
-            }
-        }
-        Ok(())
-    }
-
     fn subscription(&self) -> Subscription<Message> {
-        // Use a plain fn pointer (no captures) — all routing happens in update()
         let keyboard_sub = keyboard::on_key_press(|key, modifiers| {
             Some(Message::KeyPressed(key, modifiers))
         });
 
-        // Poll PTY output periodically when terminal is active
-        if self.terminal_spawned && self.terminal_visible {
-            let pty_poll = iced::time::every(std::time::Duration::from_millis(50))
-                .map(|_| Message::TerminalTick);
-            Subscription::batch([keyboard_sub, pty_poll])
-        } else {
-            keyboard_sub
-        }
+        Subscription::batch([
+            keyboard_sub,
+            iced::Subscription::run_with_id(
+                self.terminal.id,
+                self.terminal.subscription(),
+            ).map(Message::TerminalEvent),
+        ])
     }
 
     fn toggle_folder_recursive(node: &mut FileNode, target: &Path) {
@@ -3054,9 +2749,6 @@ impl Config {
     fn view_main_area(&self) -> Element<'_, Message> {
         let mut editor_row_items: Vec<Element<'_, Message>> = vec![self.view_editor()];
 
-        // Add scrollbar indicator
-        editor_row_items.push(self.view_scrollbar());
-
         // Right dock: minimap and/or outline
         if self.right_dock_visible {
             if self.minimap_visible {
@@ -3234,13 +2926,16 @@ impl Config {
                 })
                 .on_action(Message::EditorAction);
 
-            let editor_container: Element<'_, Message> = container(editor)
+            let editor_container = scrollable(container(editor)
                 .width(Length::Fill)
+                .height(Length::Shrink))
                 .height(Length::Fill)
-                .into();
+                .width(Length::Fill);
+
+            let editor_element: Element<'_, Message> = editor_container.into();
 
             // Wrap in mouse_area for right-click context menu
-            mouse_area(editor_container)
+            mouse_area(editor_element)
                 .on_right_press(Message::ShowEditorContextMenu)
                 .into()
         } else {
@@ -3261,85 +2956,7 @@ impl Config {
     // Scrollbar
     // ========================================================================
 
-    fn view_scrollbar(&self) -> Element<'_, Message> {
-        let track_bg = Color::from_rgb(0.12, 0.12, 0.14);
-        let thumb_color = Color::from_rgba(0.60, 0.60, 0.65, 0.7);
-        let width = 14.0_f32;
-        // Use a fixed track pixel height for calculations.
-        // The actual container will stretch to Length::Fill, but
-        // we use this to compute the thumb's fixed pixel sizes.
-        let track_px = 700.0_f32;
-
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            let total_lines = tab.content.line_count().max(1) as f32;
-            let (cursor_line, _) = tab.content.cursor_position();
-
-            let effective_pos = if self.editor_scroll_offset > 0.0 {
-                self.editor_scroll_offset
-            } else {
-                cursor_line as f32
-            };
-
-            let line_height = self.font_size * 1.6;
-            let viewport_lines = (track_px / line_height).max(10.0);
-
-            // No thumb needed if all content fits
-            if total_lines <= viewport_lines + 5.0 {
-                return container(Space::new(width, Length::Fill))
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(track_bg)),
-                        ..Default::default()
-                    })
-                    .into();
-            }
-
-            // Thumb height: proportional to viewport/total
-            let thumb_frac = (viewport_lines / total_lines).clamp(0.05, 0.9);
-            let thumb_h = (thumb_frac * track_px).clamp(30.0, track_px - 10.0);
-
-            // Thumb position: how far down
-            let max_scroll = (total_lines - viewport_lines).max(1.0);
-            let pos_frac = (effective_pos / max_scroll).clamp(0.0, 1.0);
-            let top_space = (pos_frac * (track_px - thumb_h)).clamp(0.0, track_px - thumb_h);
-
-            // Build: a column with top spacer (fixed px), thumb (fixed px), rest fills
-            let track = column![
-                // Top spacer
-                Space::new(width, Length::Fixed(top_space)),
-                // Thumb
-                container(Space::new(width - 4.0, Length::Fixed(thumb_h)))
-                    .center_x(width)
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(thumb_color)),
-                        border: Border {
-                            radius: 4.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                // Bottom fills remaining
-                Space::new(width, Length::Fill),
-            ]
-            .width(Length::Fixed(width))
-            .height(Length::Fill);
-
-            container(track)
-                .width(Length::Fixed(width))
-                .height(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(track_bg)),
-                    ..Default::default()
-                })
-                .into()
-        } else {
-            container(Space::new(width, Length::Fill))
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(track_bg)),
-                    ..Default::default()
-                })
-                .into()
-        }
-    }
+    // view_scrollbar was removed
 
     // ========================================================================
     // Minimap
@@ -3784,29 +3401,8 @@ impl Config {
         });
 
         // Terminal output area - all PTY output including prompts
-        let mut output_items: Vec<Element<'_, Message>> = Vec::new();
-        for line in &self.terminal_output {
-            // Color the prompt green, errors red, rest white
-            let line_color = if line.contains("error") || line.contains("Error") || line.contains("No such file") {
-                Color::from_rgb(0.90, 0.40, 0.40)
-            } else if line.contains('@') && line.contains('$') {
-                // Looks like a bash prompt
-                Color::from_rgb(0.40, 0.85, 0.40)
-            } else {
-                Color::from_rgb(0.82, 0.82, 0.84)
-            };
-            output_items.push(
-                text(line).size(13).font(Font::MONOSPACE).color(line_color).into()
-            );
-        }
-
-        let output_column = Column::with_children(output_items)
-            .spacing(2)
-            .width(Length::Fill);
-
-        let output_scroll = scrollable(output_column)
-            .height(Length::Fill)
-            .anchor_bottom();
+        let term_view = iced_term::TerminalView::show(&self.terminal)
+            .map(Message::TerminalEvent);
 
         // Focus indicator: colored left border when terminal has focus
         let focus_border_color = if self.terminal_focused {
@@ -3815,13 +3411,13 @@ impl Config {
             Color::TRANSPARENT
         };
 
+        let term_element: Element<'_, Message> = term_view.into();
         let terminal_content = Column::new()
             .push(header)
             .push(
-                container(output_scroll)
+                container(term_element)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .padding(Padding::from([6, 12]))
             )
             .width(Length::Fill)
             .height(Length::Fill);
