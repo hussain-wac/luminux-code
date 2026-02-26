@@ -1,0 +1,41 @@
+    Checking luminex-ui v0.1.0 (C:\Users\l7cre\Desktop\luminux-code\crates\luminex-ui)
+warning: unused import: `Path`
+ --> crates\luminex-ui\src\app\mod.rs:3:17
+  |
+3 | use std::path::{Path, PathBuf};
+  |                 ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `TopMenu`
+ --> crates\luminex-ui\src\app\update.rs:4:60
+  |
+4 | use super::{App, Message, TabInfo, FileNode, DeletedEntry, TopMenu};
+  |                                                            ^^^^^^^
+
+warning: unused import: `std::path::PathBuf`
+ --> crates\luminex-ui\src\app\view\mod.rs:9:5
+  |
+9 | use std::path::PathBuf;
+  |     ^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated item named `Dark` found for struct `theme::Theme` in the current scope
+   --> crates\luminex-ui\src\app\mod.rs:156:41
+    |
+156 |         .theme(|_| crate::theme::Theme::Dark)
+    |                                         ^^^^ associated item not found in `theme::Theme`
+    |
+   ::: crates\luminex-ui\src\theme.rs:40:1
+    |
+ 40 | pub struct Theme {
+    | ---------------- associated item `Dark` not found for this struct
+    |
+help: there is an associated function `dark` with a similar name
+   --> crates\luminex-ui\src\theme.rs:123:5
+    |
+123 |     pub fn dark() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `luminex-ui` (lib) generated 3 warnings
+error: could not compile `luminex-ui` (lib) due to 1 previous error; 3 warnings emitted

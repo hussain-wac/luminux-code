@@ -241,3 +241,21 @@ impl Default for Theme {
         Self::dark()
     }
 }
+
+pub mod colors {
+    use iced::Color;
+
+    pub const BG_DARK: Color = Color::from_rgb(0.11, 0.11, 0.13);
+    pub const BG_MEDIUM: Color = Color::from_rgb(0.14, 0.14, 0.16);
+    pub const BG_LIGHT: Color = Color::from_rgb(0.18, 0.18, 0.20);
+    pub const BG_HOVER: Color = Color::from_rgb(0.22, 0.22, 0.25);
+    pub const BG_ACTIVE: Color = Color::from_rgb(0.25, 0.25, 0.28);
+
+    pub const TEXT_PRIMARY: Color = Color::from_rgb(0.93, 0.93, 0.93);
+    pub const TEXT_SECONDARY: Color = Color::from_rgb(0.65, 0.65, 0.68);
+    pub const TEXT_MUTED: Color = Color::from_rgb(0.45, 0.45, 0.48);
+
+    pub const ACCENT: Color = Color::from_rgb(0.36, 0.54, 0.90);
+
+    pub const BORDER: Color = Color::from_rgb(0.25, 0.25, 0.28);
+}
