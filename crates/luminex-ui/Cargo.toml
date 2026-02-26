@@ -1,0 +1,30 @@
+[package]
+name = "luminex-ui"
+version = "0.1.0"
+edition = "2024"
+description = "Modern UI for Luminex editor using iced"
+
+[dependencies]
+luminex-core = { path = "../luminex-core" }
+luminex-buffer = { path = "../luminex-buffer" }
+luminex-syntax = { path = "../luminex-syntax" }
+
+# GUI framework
+iced = { version = "0.13", features = ["tokio", "advanced"] }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Serialization (for themes)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# File dialogs
+rfd = "0.14"

@@ -1,0 +1,32 @@
+[package]
+name = "luminex-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core editor logic and state management"
+
+[dependencies]
+luminex-buffer = { path = "../luminex-buffer" }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+
+# File watching
+notify = "6.1"
+
+# Directories
+dirs = "5.0"
+
+# Unique IDs
+uuid = { version = "1.6", features = ["v4", "serde"] }

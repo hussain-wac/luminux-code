@@ -1,0 +1,23 @@
+[package]
+name = "luminex-buffer"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance text buffer using rope data structure"
+
+[dependencies]
+# Rope data structure for efficient text manipulation
+ropey = "1.6"
+
+# Unicode support
+unicode-segmentation = "1.10"
+unicode-width = "0.1"
+
+# Error handling
+thiserror = "1.0"
+
+# Serialization for undo/redo state
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.4"
