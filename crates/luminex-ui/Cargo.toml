@@ -28,3 +28,6 @@ serde_json = "1.0"
 
 # File dialogs
 rfd = "0.14"
+
+# System clipboard access
+arboard = "3"

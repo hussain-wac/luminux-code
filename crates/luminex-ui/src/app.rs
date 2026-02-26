@@ -4,8 +4,8 @@
 
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, horizontal_space, row, scrollable, stack, text, text_editor, Column, Row,
-    Space, mouse_area,
+    button, column, container, horizontal_space, row, scrollable, stack, text, text_editor, text_input,
+    Column, Row, Space, mouse_area,
 };
 use iced::{Background, Border, Color, Element, Font, Length, Padding, Point, Subscription, Task, Theme};
 use std::path::{Path, PathBuf};
@@ -207,6 +207,68 @@ impl Default for ContextMenu {
     }
 }
 
+/// Stores info needed to undo a file/folder deletion from the explorer.
+#[derive(Debug, Clone)]
+struct DeletedEntry {
+    /// Original path of the deleted item.
+    path: PathBuf,
+    /// If the item was a file, its contents. `None` for directories.
+    content: Option<Vec<u8>>,
+    /// If the item was a directory, a recursive snapshot of its contents.
+    children: Vec<DeletedEntry>,
+    is_dir: bool,
+}
+
+impl DeletedEntry {
+    /// Recursively snapshot a path before deleting it.
+    fn snapshot(path: &Path) -> Option<Self> {
+        let is_dir = path.is_dir();
+        if is_dir {
+            let mut children = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    if let Some(child) = Self::snapshot(&entry.path()) {
+                        children.push(child);
+                    }
+                }
+            }
+            Some(Self {
+                path: path.to_path_buf(),
+                content: None,
+                children,
+                is_dir: true,
+            })
+        } else {
+            let content = std::fs::read(path).ok();
+            Some(Self {
+                path: path.to_path_buf(),
+                content,
+                children: Vec::new(),
+                is_dir: false,
+            })
+        }
+    }
+
+    /// Restore this entry (and its children) back to disk.
+    fn restore(&self) -> Result<(), String> {
+        if self.is_dir {
+            std::fs::create_dir_all(&self.path)
+                .map_err(|e| format!("Failed to restore directory: {}", e))?;
+            for child in &self.children {
+                child.restore()?;
+            }
+        } else if let Some(content) = &self.content {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dir: {}", e))?;
+            }
+            std::fs::write(&self.path, content)
+                .map_err(|e| format!("Failed to restore file: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
 pub struct App {
     tabs: Vec<TabInfo>,
     active_tab: usize,
@@ -219,6 +281,39 @@ pub struct App {
     context_menu: ContextMenu,
     clipboard_path: Option<PathBuf>,
     clipboard_is_cut: bool,
+    /// Track the last known mouse position in the sidebar for context menu placement.
+    last_cursor_position: Point,
+    /// Stack of deleted entries for Ctrl+Z undo in the explorer.
+    deleted_stack: Vec<DeletedEntry>,
+    /// Whether we are showing a delete-confirmation modal.
+    confirm_delete_visible: bool,
+    /// The target path pending deletion (set when confirmation is requested).
+    confirm_delete_target: Option<PathBuf>,
+    /// Whether the minimap panel is visible.
+    minimap_visible: bool,
+    /// Whether the rename modal is visible.
+    rename_visible: bool,
+    /// The path being renamed.
+    rename_target: Option<PathBuf>,
+    /// Current text in the rename input field.
+    rename_input: String,
+    /// Whether the editor right-click context menu is visible.
+    editor_context_visible: bool,
+    /// Position for the editor context menu.
+    editor_context_position: Point,
+    /// Which top menu bar dropdown is currently open (None = all closed).
+    active_menu: Option<TopMenu>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopMenu {
+    File,
+    Edit,
+    Selection,
+    View,
+    Go,
+    Window,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +357,36 @@ pub enum Message {
     ContextNewFolder,
     ContextRename,
 
+    // Mouse tracking
+    MouseMoved(Point),
+
+    // Delete confirmation modal
+    ConfirmDeleteYes,
+    ConfirmDeleteCancel,
+
+    // Undo deleted file in explorer
+    UndoExplorerDelete,
+
+    // Minimap
+    ToggleMinimap,
+
+    // Rename
+    RenameInputChanged(String),
+    RenameConfirm,
+    RenameCancel,
+
+    // Editor context menu
+    ShowEditorContextMenu,
+    HideEditorContextMenu,
+    EditorCut,
+    EditorCopy,
+    EditorPaste,
+    EditorSelectAll,
+
+    // Top menu bar
+    ToggleTopMenu(TopMenu),
+    CloseTopMenu,
+
     // Async results
     FileOpened(Result<(PathBuf, String), String>),
     FolderOpened(Result<PathBuf, String>),
@@ -283,6 +408,17 @@ impl App {
             context_menu: ContextMenu::default(),
             clipboard_path: None,
             clipboard_is_cut: false,
+            last_cursor_position: Point::ORIGIN,
+            deleted_stack: Vec::new(),
+            confirm_delete_visible: false,
+            confirm_delete_target: None,
+            minimap_visible: true,
+            rename_visible: false,
+            rename_target: None,
+            rename_input: String::new(),
+            editor_context_visible: false,
+            editor_context_position: Point::ORIGIN,
+            active_menu: None,
         };
 
         // Set initial content with sample Rust code
@@ -353,6 +489,7 @@ impl Config {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::NewFile => {
+                self.active_menu = None;
                 self.untitled_counter += 1;
                 self.tabs.push(TabInfo::new_untitled(self.untitled_counter));
                 self.active_tab = self.tabs.len() - 1;
@@ -360,6 +497,7 @@ impl Config {
             }
 
             Message::OpenFile => {
+                self.active_menu = None;
                 return Task::perform(
                     async {
                         let handle = rfd::AsyncFileDialog::new()
@@ -386,6 +524,7 @@ impl Config {
             }
 
             Message::OpenFolder => {
+                self.active_menu = None;
                 return Task::perform(
                     async {
                         let handle = rfd::AsyncFileDialog::new().pick_folder().await;
@@ -400,6 +539,7 @@ impl Config {
             }
 
             Message::Save => {
+                self.active_menu = None;
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     if let Some(path) = &tab.path {
                         let path = path.clone();
@@ -420,6 +560,7 @@ impl Config {
             }
 
             Message::SaveAs => {
+                self.active_menu = None;
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     let content = tab.content.text();
                     let default_name = tab.name.clone();
@@ -459,6 +600,7 @@ impl Config {
             }
 
             Message::CloseCurrentTab => {
+                self.active_menu = None;
                 let idx = self.active_tab;
                 if self.tabs.len() > 1 && idx < self.tabs.len() {
                     self.tabs.remove(idx);
@@ -498,6 +640,7 @@ impl Config {
             }
 
             Message::Undo => {
+                self.active_menu = None;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     if tab.undo() {
                         self.status_message = "Undo".to_string();
@@ -508,6 +651,7 @@ impl Config {
             }
 
             Message::Redo => {
+                self.active_menu = None;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     if tab.redo() {
                         self.status_message = "Redo".to_string();
@@ -518,6 +662,11 @@ impl Config {
             }
 
             Message::EditorAction(action) => {
+                // Close any open context menus when the editor is interacted with
+                self.context_menu.visible = false;
+                self.editor_context_visible = false;
+                self.active_menu = None;
+
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let is_edit = action.is_edit();
 
@@ -535,6 +684,9 @@ impl Config {
             }
 
             Message::TabSelected(idx) => {
+                self.context_menu.visible = false;
+                self.editor_context_visible = false;
+                self.active_menu = None;
                 if idx < self.tabs.len() {
                     self.active_tab = idx;
                     let name = self.tabs[idx].name.clone();
@@ -543,6 +695,7 @@ impl Config {
             }
 
             Message::NextTab => {
+                self.active_menu = None;
                 if !self.tabs.is_empty() {
                     self.active_tab = (self.active_tab + 1) % self.tabs.len();
                     let name = self.tabs[self.active_tab].name.clone();
@@ -551,6 +704,7 @@ impl Config {
             }
 
             Message::PrevTab => {
+                self.active_menu = None;
                 if !self.tabs.is_empty() {
                     self.active_tab = if self.active_tab == 0 {
                         self.tabs.len() - 1
@@ -563,6 +717,9 @@ impl Config {
             }
 
             Message::FileClicked(path) => {
+                self.context_menu.visible = false;
+                self.editor_context_visible = false;
+                self.active_menu = None;
                 if path.is_file() {
                     // Check if already open
                     for (idx, tab) in self.tabs.iter().enumerate() {
@@ -587,12 +744,18 @@ impl Config {
             }
 
             Message::ToggleFolder(path) => {
+                self.context_menu.visible = false;
+                self.editor_context_visible = false;
+                self.active_menu = None;
                 if let Some(tree) = &mut self.file_tree {
                     Self::toggle_folder_recursive(tree, &path);
                 }
             }
 
             Message::ToggleSidebar => {
+                self.context_menu.visible = false;
+                self.editor_context_visible = false;
+                self.active_menu = None;
                 self.sidebar_visible = !self.sidebar_visible;
             }
 
@@ -663,9 +826,11 @@ impl Config {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "item".to_string());
                     self.refresh_file_tree();
-                    self.status_message = format!("Deleted: {}", name);
+                    self.status_message = format!("Deleted: {} (Ctrl+Z to undo)", name);
                 }
                 Err(e) => {
+                    // Deletion failed, remove the snapshot we took
+                    self.deleted_stack.pop();
                     self.status_message = format!("Delete failed: {}", e);
                 }
             },
@@ -694,11 +859,15 @@ impl Config {
                 }
             }
 
+            Message::MouseMoved(point) => {
+                self.last_cursor_position = point;
+            }
+
             // Context menu messages
-            Message::ShowContextMenu(position, target, is_directory) => {
+            Message::ShowContextMenu(_position, target, is_directory) => {
                 self.context_menu = ContextMenu {
                     visible: true,
-                    position,
+                    position: self.last_cursor_position,
                     target,
                     is_directory,
                 };
@@ -780,6 +949,30 @@ impl Config {
             Message::ContextDelete => {
                 self.context_menu.visible = false;
                 if let Some(target) = self.context_menu.target.clone() {
+                    // Show confirmation modal instead of deleting immediately
+                    self.confirm_delete_target = Some(target);
+                    self.confirm_delete_visible = true;
+                }
+            }
+
+            Message::ConfirmDeleteCancel => {
+                self.confirm_delete_visible = false;
+                self.confirm_delete_target = None;
+                self.status_message = "Delete cancelled".to_string();
+            }
+
+            Message::ConfirmDeleteYes => {
+                self.confirm_delete_visible = false;
+                if let Some(target) = self.confirm_delete_target.take() {
+                    // Snapshot before deletion for undo
+                    if let Some(snapshot) = DeletedEntry::snapshot(&target) {
+                        self.deleted_stack.push(snapshot);
+                        // Keep stack bounded
+                        if self.deleted_stack.len() > 50 {
+                            self.deleted_stack.remove(0);
+                        }
+                    }
+
                     let target_clone = target.clone();
                     return Task::perform(
                         async move {
@@ -795,6 +988,34 @@ impl Config {
                         },
                         Message::FileDeleted,
                     );
+                }
+            }
+
+            Message::UndoExplorerDelete => {
+                if let Some(entry) = self.deleted_stack.pop() {
+                    let name = entry.path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "item".to_string());
+                    match entry.restore() {
+                        Ok(_) => {
+                            self.refresh_file_tree();
+                            self.status_message = format!("Restored: {}", name);
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Restore failed: {}", e);
+                            // Put it back since restore failed
+                            // (entry is consumed, can't push back easily)
+                        }
+                    }
+                } else {
+                    // No deleted explorer entry, fall through to editor undo
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        if tab.undo() {
+                            self.status_message = "Undo".to_string();
+                        } else {
+                            self.status_message = "Nothing to undo".to_string();
+                        }
+                    }
                 }
             }
 
@@ -857,9 +1078,147 @@ impl Config {
 
             Message::ContextRename => {
                 self.context_menu.visible = false;
-                // Note: Full rename requires a text input dialog, which is complex in iced
-                // For now, show a message
-                self.status_message = "Rename: Use your file manager for now".to_string();
+                if let Some(target) = self.context_menu.target.clone() {
+                    let current_name = target.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.rename_target = Some(target);
+                    self.rename_input = current_name;
+                    self.rename_visible = true;
+                }
+            }
+
+            Message::RenameInputChanged(value) => {
+                self.rename_input = value;
+            }
+
+            Message::RenameCancel => {
+                self.rename_visible = false;
+                self.rename_target = None;
+                self.rename_input.clear();
+                self.status_message = "Rename cancelled".to_string();
+            }
+
+            Message::RenameConfirm => {
+                self.rename_visible = false;
+                let new_name = self.rename_input.trim().to_string();
+                if let Some(target) = self.rename_target.take() {
+                    if new_name.is_empty() {
+                        self.status_message = "Rename failed: name cannot be empty".to_string();
+                    } else if let Some(parent) = target.parent() {
+                        let new_path = parent.join(&new_name);
+                        if new_path == target {
+                            self.status_message = "Name unchanged".to_string();
+                        } else if new_path.exists() {
+                            self.status_message = format!("Rename failed: \"{}\" already exists", new_name);
+                        } else {
+                            match std::fs::rename(&target, &new_path) {
+                                Ok(_) => {
+                                    // Update any open tab that references this path
+                                    for tab in &mut self.tabs {
+                                        if tab.path.as_ref() == Some(&target) {
+                                            tab.path = Some(new_path.clone());
+                                            tab.name = new_name.clone();
+                                            tab.language = detect_language(&new_name).to_string();
+                                        }
+                                    }
+                                    self.refresh_file_tree();
+                                    self.status_message = format!("Renamed to: {}", new_name);
+                                }
+                                Err(e) => {
+                                    self.status_message = format!("Rename failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.rename_input.clear();
+            }
+
+            Message::ToggleMinimap => {
+                self.minimap_visible = !self.minimap_visible;
+            }
+
+            // Top menu bar
+            Message::ToggleTopMenu(menu) => {
+                if self.active_menu == Some(menu) {
+                    self.active_menu = None;
+                } else {
+                    self.active_menu = Some(menu);
+                }
+            }
+
+            Message::CloseTopMenu => {
+                self.active_menu = None;
+            }
+
+            // Editor context menu
+            Message::ShowEditorContextMenu => {
+                self.editor_context_visible = true;
+                self.editor_context_position = self.last_cursor_position;
+                // Close file explorer context menu if open
+                self.context_menu.visible = false;
+            }
+
+            Message::HideEditorContextMenu => {
+                self.editor_context_visible = false;
+            }
+
+            Message::EditorCut => {
+                self.editor_context_visible = false;
+                self.active_menu = None;
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if let Some(selected) = tab.content.selection() {
+                        tab.save_undo_state();
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(&selected);
+                        }
+                        tab.content.perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                        tab.modified = true;
+                        self.status_message = "Cut".to_string();
+                    }
+                }
+            }
+
+            Message::EditorCopy => {
+                self.editor_context_visible = false;
+                self.active_menu = None;
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    if let Some(selected) = tab.content.selection() {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(&selected);
+                        }
+                        self.status_message = "Copied".to_string();
+                    } else {
+                        self.status_message = "Nothing selected".to_string();
+                    }
+                }
+            }
+
+            Message::EditorPaste => {
+                self.editor_context_visible = false;
+                self.active_menu = None;
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(clip_text) = clipboard.get_text() {
+                            tab.save_undo_state();
+                            tab.content.perform(text_editor::Action::Edit(
+                                text_editor::Edit::Paste(std::sync::Arc::new(clip_text))
+                            ));
+                            tab.modified = true;
+                            self.status_message = "Pasted".to_string();
+                        }
+                    }
+                }
+            }
+
+            Message::EditorSelectAll => {
+                self.editor_context_visible = false;
+                self.active_menu = None;
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.content.perform(text_editor::Action::SelectAll);
+                    self.status_message = "Selected all".to_string();
+                }
             }
 
         }
@@ -868,10 +1227,37 @@ impl Config {
 
     fn refresh_file_tree(&mut self) {
         if let Some(current_folder) = &self.current_folder {
+            // Collect the set of currently expanded paths before rebuilding
+            let mut expanded_paths = std::collections::HashSet::new();
+            if let Some(old_tree) = &self.file_tree {
+                Self::collect_expanded_paths(old_tree, &mut expanded_paths);
+            }
+
             if let Some(mut tree) = FileNode::from_path(current_folder, 0) {
                 tree.expanded = true;
                 tree.load_children();
+                // Re-expand all folders that were expanded before
+                Self::restore_expanded_state(&mut tree, &expanded_paths);
                 self.file_tree = Some(tree);
+            }
+        }
+    }
+
+    fn collect_expanded_paths(node: &FileNode, set: &mut std::collections::HashSet<PathBuf>) {
+        if node.expanded {
+            set.insert(node.path.clone());
+            for child in &node.children {
+                Self::collect_expanded_paths(child, set);
+            }
+        }
+    }
+
+    fn restore_expanded_state(node: &mut FileNode, expanded: &std::collections::HashSet<PathBuf>) {
+        if node.is_dir && expanded.contains(&node.path) {
+            node.expanded = true;
+            node.load_children();
+            for child in &mut node.children {
+                Self::restore_expanded_state(child, expanded);
             }
         }
     }
@@ -916,7 +1302,7 @@ impl Config {
                             if modifiers.shift() {
                                 return Some(Message::Redo);
                             } else {
-                                return Some(Message::Undo);
+                                return Some(Message::UndoExplorerDelete);
                             }
                         }
                         "y" => return Some(Message::Redo),
@@ -974,8 +1360,47 @@ impl Config {
             })
             .into();
 
-        // If context menu is visible, show it as overlay
-        if self.context_menu.visible {
+        // Track mouse movement globally for context menu positioning
+        let tracked_view: Element<'_, Message> = mouse_area(main_view)
+            .on_move(Message::MouseMoved)
+            .into();
+
+        // If delete confirmation modal is visible, show it
+        if self.confirm_delete_visible {
+            stack![
+                tracked_view,
+                // Dim overlay
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
+                            ..Default::default()
+                        })
+                )
+                .on_press(Message::ConfirmDeleteCancel),
+                self.view_confirm_delete_modal(),
+            ]
+            .into()
+        } else if self.rename_visible {
+            stack![
+                tracked_view,
+                // Dim overlay
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
+                            ..Default::default()
+                        })
+                )
+                .on_press(Message::RenameCancel),
+                self.view_rename_modal(),
+            ]
+            .into()
+        } else if self.context_menu.visible {
             stack![
                 // Click-away layer to close menu
                 mouse_area(
@@ -984,12 +1409,25 @@ impl Config {
                         .height(Length::Fill)
                 )
                 .on_press(Message::HideContextMenu),
-                main_view,
+                tracked_view,
                 self.view_context_menu(),
             ]
             .into()
+        } else if self.active_menu.is_some() {
+            stack![
+                // Click-away layer to close dropdown
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                )
+                .on_press(Message::CloseTopMenu),
+                tracked_view,
+                self.view_menu_dropdown(),
+            ]
+            .into()
         } else {
-            main_view
+            tracked_view
         }
     }
 
@@ -1071,6 +1509,14 @@ impl Config {
                     .into()
             );
             items.push(
+                button(text("Rename").size(12).color(colors::TEXT_PRIMARY))
+                    .width(Length::Fill)
+                    .padding(Padding::from([6, 12]))
+                    .style(menu_btn_style)
+                    .on_press(Message::ContextRename)
+                    .into()
+            );
+            items.push(
                 button(text("Delete").size(12).color(Color::from_rgb(0.9, 0.4, 0.4)))
                     .width(Length::Fill)
                     .padding(Padding::from([6, 12]))
@@ -1118,91 +1564,285 @@ impl Config {
 
         let menu_content = Column::with_children(items).width(Length::Fixed(150.0));
 
-        // Position the menu (fixed position since we can't get exact cursor position in iced)
-        // We position it at top-left of sidebar area as a simple approach
+        // Position the context menu at the cursor position
+        let x = self.context_menu.position.x;
+        let y = self.context_menu.position.y;
+
+        let menu_box = container(menu_content)
+            .padding(4)
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BG_MEDIUM)),
+                border: Border {
+                    color: colors::BORDER,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Use a row/column with fixed-size spacers to push the menu to the cursor position
+        column![
+            Space::with_height(Length::Fixed(y)),
+            row![
+                Space::with_width(Length::Fixed(x)),
+                menu_box,
+            ],
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn view_confirm_delete_modal(&self) -> Element<'_, Message> {
+        let target_name = self.confirm_delete_target
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "this item".to_string());
+
+        let is_dir = self.confirm_delete_target
+            .as_ref()
+            .map(|p| p.is_dir())
+            .unwrap_or(false);
+
+        let item_type = if is_dir { "folder" } else { "file" };
+
+        let modal_content = column![
+            text("Confirm Delete").size(16).color(colors::TEXT_PRIMARY),
+            Space::with_height(12),
+            text(format!("Are you sure you want to delete the {} \"{}\"?", item_type, target_name))
+                .size(13)
+                .color(colors::TEXT_SECONDARY),
+            Space::with_height(4),
+            text("You can undo this with Ctrl+Z.")
+                .size(11)
+                .color(colors::TEXT_MUTED),
+            Space::with_height(16),
+            row![
+                button(
+                    text("Cancel").size(13).color(colors::TEXT_PRIMARY)
+                )
+                .padding(Padding::from([8, 20]))
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => colors::BG_HOVER,
+                        _ => colors::BG_LIGHT,
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: colors::TEXT_PRIMARY,
+                        border: Border {
+                            color: colors::BORDER,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::ConfirmDeleteCancel),
+                Space::with_width(12),
+                button(
+                    text("Delete").size(13).color(Color::from_rgb(1.0, 1.0, 1.0))
+                )
+                .padding(Padding::from([8, 20]))
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => Color::from_rgb(0.85, 0.25, 0.25),
+                        _ => Color::from_rgb(0.75, 0.22, 0.22),
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: Color::WHITE,
+                        border: Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::ConfirmDeleteYes),
+            ]
+            .align_y(iced::Alignment::Center),
+        ]
+        .padding(24)
+        .width(Length::Fixed(380.0));
+
+        // Center the modal on screen
         container(
-            container(menu_content)
-                .padding(4)
+            container(modal_content)
                 .style(|_| container::Style {
                     background: Some(Background::Color(colors::BG_MEDIUM)),
                     border: Border {
                         color: colors::BORDER,
                         width: 1.0,
-                        radius: 4.0.into(),
+                        radius: 8.0.into(),
                     },
                     ..Default::default()
                 })
         )
-        .padding(Padding::from([50, 12]))
-        .width(Length::Shrink)
-        .height(Length::Shrink)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    }
+
+    fn view_rename_modal(&self) -> Element<'_, Message> {
+        let original_name = self.rename_target
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let modal_content = column![
+            text("Rename").size(16).color(colors::TEXT_PRIMARY),
+            Space::with_height(12),
+            text(format!("Renaming: \"{}\"", original_name))
+                .size(12)
+                .color(colors::TEXT_MUTED),
+            Space::with_height(8),
+            text_input("Enter new name...", &self.rename_input)
+                .on_input(Message::RenameInputChanged)
+                .on_submit(Message::RenameConfirm)
+                .padding(Padding::from([8, 12]))
+                .size(13),
+            Space::with_height(16),
+            row![
+                button(
+                    text("Cancel").size(13).color(colors::TEXT_PRIMARY)
+                )
+                .padding(Padding::from([8, 20]))
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => colors::BG_HOVER,
+                        _ => colors::BG_LIGHT,
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: colors::TEXT_PRIMARY,
+                        border: Border {
+                            color: colors::BORDER,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::RenameCancel),
+                Space::with_width(12),
+                button(
+                    text("Rename").size(13).color(Color::WHITE)
+                )
+                .padding(Padding::from([8, 20]))
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => Color::from_rgb(0.40, 0.58, 0.95),
+                        _ => colors::ACCENT,
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: Color::WHITE,
+                        border: Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::RenameConfirm),
+            ]
+            .align_y(iced::Alignment::Center),
+        ]
+        .padding(24)
+        .width(Length::Fixed(380.0));
+
+        container(
+            container(modal_content)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(colors::BG_MEDIUM)),
+                    border: Border {
+                        color: colors::BORDER,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                })
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
         .into()
     }
 
     // ========================================================================
-    // Toolbar
+    // Menu Bar (Zed-style top menu)
     // ========================================================================
 
     fn view_toolbar(&self) -> Element<'_, Message> {
-        let btn_style = |_: &Theme, status: button::Status| -> button::Style {
-            let bg = match status {
-                button::Status::Hovered => colors::BG_HOVER,
-                button::Status::Pressed => colors::BG_ACTIVE,
-                _ => colors::BG_LIGHT,
+        let menus = [
+            TopMenu::File,
+            TopMenu::Edit,
+            TopMenu::Selection,
+            TopMenu::View,
+            TopMenu::Go,
+            TopMenu::Window,
+            TopMenu::Help,
+        ];
+
+        let mut menu_items: Vec<Element<'_, Message>> = Vec::new();
+
+        for menu in menus {
+            let label = match menu {
+                TopMenu::File => "File",
+                TopMenu::Edit => "Edit",
+                TopMenu::Selection => "Selection",
+                TopMenu::View => "View",
+                TopMenu::Go => "Go",
+                TopMenu::Window => "Window",
+                TopMenu::Help => "Help",
             };
-            button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: colors::TEXT_PRIMARY,
-                border: Border {
-                    radius: 4.0.into(),
-                    color: colors::BORDER,
-                    width: 1.0,
-                },
-                ..Default::default()
-            }
-        };
 
-        let sidebar_btn = button(text("[=]").size(12).font(Font::MONOSPACE))
+            let is_active = self.active_menu == Some(menu);
+
+            let menu_btn = button(
+                text(label).size(12).color(if is_active {
+                    colors::TEXT_PRIMARY
+                } else {
+                    colors::TEXT_SECONDARY
+                }),
+            )
             .padding(Padding::from([6, 10]))
-            .style(btn_style)
-            .on_press(Message::ToggleSidebar);
+            .style(move |_: &Theme, status: button::Status| {
+                let bg = if is_active {
+                    colors::BG_ACTIVE
+                } else {
+                    match status {
+                        button::Status::Hovered => colors::BG_HOVER,
+                        _ => colors::BG_MEDIUM,
+                    }
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: colors::TEXT_PRIMARY,
+                    border: Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .on_press(Message::ToggleTopMenu(menu));
 
-        let new_btn = button(text("New").size(12))
-            .padding(Padding::from([6, 12]))
-            .style(btn_style)
-            .on_press(Message::NewFile);
+            menu_items.push(menu_btn.into());
+        }
 
-        let open_file_btn = button(text("Open").size(12))
-            .padding(Padding::from([6, 12]))
-            .style(btn_style)
-            .on_press(Message::OpenFile);
+        menu_items.push(horizontal_space().into());
 
-        let open_folder_btn = button(text("Folder").size(12))
-            .padding(Padding::from([6, 12]))
-            .style(btn_style)
-            .on_press(Message::OpenFolder);
-
-        let save_btn = button(text("Save").size(12))
-            .padding(Padding::from([6, 12]))
-            .style(btn_style)
-            .on_press(Message::Save);
-
-        let toolbar = row![
-            sidebar_btn,
-            Space::with_width(12),
-            new_btn,
-            open_file_btn,
-            open_folder_btn,
-            save_btn,
-            horizontal_space(),
-            text("Ctrl+Z: Undo | Ctrl+Y: Redo | Ctrl+C/V/X: Copy/Paste/Cut")
-                .size(11)
-                .color(colors::TEXT_MUTED),
-            Space::with_width(12),
-        ]
-        .spacing(4)
-        .padding(Padding::from([8, 12]))
-        .align_y(iced::Alignment::Center);
+        let toolbar = Row::with_children(menu_items)
+            .spacing(2)
+            .padding(Padding::from([4, 8]))
+            .align_y(iced::Alignment::Center);
 
         container(toolbar)
             .width(Length::Fill)
@@ -1216,6 +1856,176 @@ impl Config {
                 ..Default::default()
             })
             .into()
+    }
+
+    /// Build a single dropdown menu item with label, shortcut, and action.
+    fn menu_item<'a>(label: &'a str, shortcut: &'a str, msg: Message) -> Element<'a, Message> {
+        button(
+            row![
+                text(label).size(12).color(colors::TEXT_PRIMARY),
+                horizontal_space(),
+                text(shortcut).size(11).color(colors::TEXT_MUTED),
+            ]
+            .width(Length::Fill)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([6, 16]))
+        .style(|_: &Theme, status: button::Status| {
+            let bg = match status {
+                button::Status::Hovered => colors::BG_HOVER,
+                _ => Color::TRANSPARENT,
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: colors::TEXT_PRIMARY,
+                border: Border::default(),
+                ..Default::default()
+            }
+        })
+        .on_press(msg)
+        .into()
+    }
+
+    /// Build a disabled menu item (grayed out, no action).
+    fn menu_item_disabled<'a>(label: &'a str, shortcut: &'a str) -> Element<'a, Message> {
+        button(
+            row![
+                text(label).size(12).color(colors::TEXT_MUTED),
+                horizontal_space(),
+                text(shortcut).size(11).color(colors::TEXT_MUTED),
+            ]
+            .width(Length::Fill)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([6, 16]))
+        .style(|_: &Theme, _status: button::Status| button::Style {
+            background: Some(Background::Color(Color::TRANSPARENT)),
+            text_color: colors::TEXT_MUTED,
+            border: Border::default(),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn menu_separator<'a>() -> Element<'a, Message> {
+        container(Space::new(Length::Fill, 1))
+            .padding(Padding::from([4, 8]))
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BORDER)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_menu_dropdown(&self) -> Element<'_, Message> {
+        let menu = match self.active_menu {
+            Some(m) => m,
+            None => return Space::new(0, 0).into(),
+        };
+
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+        match menu {
+            TopMenu::File => {
+                items.push(Self::menu_item("New File", "Ctrl+N", Message::NewFile));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item("Open File...", "Ctrl+O", Message::OpenFile));
+                items.push(Self::menu_item("Open Folder...", "", Message::OpenFolder));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item("Save", "Ctrl+S", Message::Save));
+                items.push(Self::menu_item("Save As...", "Ctrl+Shift+S", Message::SaveAs));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item("Close Tab", "Ctrl+W", Message::CloseCurrentTab));
+            }
+            TopMenu::Edit => {
+                items.push(Self::menu_item("Undo", "Ctrl+Z", Message::UndoExplorerDelete));
+                items.push(Self::menu_item("Redo", "Ctrl+Y", Message::Redo));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item("Cut", "Ctrl+X", Message::EditorCut));
+                items.push(Self::menu_item("Copy", "Ctrl+C", Message::EditorCopy));
+                items.push(Self::menu_item("Paste", "Ctrl+V", Message::EditorPaste));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item("Select All", "Ctrl+A", Message::EditorSelectAll));
+            }
+            TopMenu::Selection => {
+                items.push(Self::menu_item("Select All", "Ctrl+A", Message::EditorSelectAll));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item_disabled("Expand Selection", ""));
+                items.push(Self::menu_item_disabled("Shrink Selection", ""));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item_disabled("Add Cursor Above", ""));
+                items.push(Self::menu_item_disabled("Add Cursor Below", ""));
+            }
+            TopMenu::View => {
+                items.push(Self::menu_item("Toggle Sidebar", "", Message::ToggleSidebar));
+                items.push(Self::menu_item("Toggle Minimap", "", Message::ToggleMinimap));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item_disabled("Zoom In", "Ctrl+="));
+                items.push(Self::menu_item_disabled("Zoom Out", "Ctrl+-"));
+                items.push(Self::menu_item_disabled("Reset Zoom", "Ctrl+0"));
+            }
+            TopMenu::Go => {
+                items.push(Self::menu_item_disabled("Go to File...", "Ctrl+P"));
+                items.push(Self::menu_item_disabled("Go to Line...", "Ctrl+G"));
+                items.push(Self::menu_item_disabled("Go to Symbol...", "Ctrl+Shift+O"));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item("Next Tab", "Ctrl+Tab", Message::NextTab));
+                items.push(Self::menu_item("Previous Tab", "Ctrl+Shift+Tab", Message::PrevTab));
+            }
+            TopMenu::Window => {
+                items.push(Self::menu_item_disabled("New Window", ""));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item_disabled("Minimize", ""));
+                items.push(Self::menu_item_disabled("Maximize", ""));
+            }
+            TopMenu::Help => {
+                items.push(Self::menu_item_disabled("Welcome", ""));
+                items.push(Self::menu_item_disabled("Documentation", ""));
+                items.push(Self::menu_separator());
+                items.push(Self::menu_item_disabled("About Luminex", ""));
+            }
+        }
+
+        let menu_width = 240.0;
+        let menu_content = Column::with_children(items)
+            .width(Length::Fixed(menu_width))
+            .padding(4);
+
+        // Calculate horizontal offset based on which menu is open
+        let menu_offset_x = match menu {
+            TopMenu::File => 8.0,
+            TopMenu::Edit => 52.0,
+            TopMenu::Selection => 92.0,
+            TopMenu::View => 160.0,
+            TopMenu::Go => 200.0,
+            TopMenu::Window => 228.0,
+            TopMenu::Help => 286.0,
+        };
+
+        let menu_box = container(menu_content)
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BG_MEDIUM)),
+                border: Border {
+                    color: colors::BORDER,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Position: toolbar height (~32px) + small gap
+        column![
+            Space::with_height(Length::Fixed(32.0)),
+            row![
+                Space::with_width(Length::Fixed(menu_offset_x)),
+                menu_box,
+            ],
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     // ========================================================================
@@ -1552,13 +2362,18 @@ impl Config {
                 })
                 .on_action(Message::EditorAction);
 
-            container(editor)
+            let editor_container: Element<'_, Message> = container(editor)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(|_| container::Style {
                     background: Some(Background::Color(colors::BG_DARK)),
                     ..Default::default()
                 })
+                .into();
+
+            // Wrap in mouse_area for right-click context menu
+            mouse_area(editor_container)
+                .on_right_press(Message::ShowEditorContextMenu)
                 .into()
         } else {
             container(text("No file open").size(16).color(colors::TEXT_MUTED))
@@ -1572,6 +2387,100 @@ impl Config {
                 })
                 .into()
         }
+    }
+
+    fn editor_menu_btn<'a>(label: &'a str, shortcut: &'a str, msg: Message, enabled: bool) -> Element<'a, Message> {
+        let text_color = if enabled { colors::TEXT_PRIMARY } else { colors::TEXT_MUTED };
+        let shortcut_color = colors::TEXT_MUTED;
+
+        let btn = button(
+            row![
+                text(label).size(12).color(text_color),
+                horizontal_space(),
+                text(shortcut).size(11).color(shortcut_color),
+            ]
+            .width(Length::Fill)
+            .align_y(iced::Alignment::Center)
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([6, 12]))
+        .style(|_: &Theme, status: button::Status| {
+            let bg = match status {
+                button::Status::Hovered => colors::BG_HOVER,
+                _ => colors::BG_MEDIUM,
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: colors::TEXT_PRIMARY,
+                border: Border::default(),
+                ..Default::default()
+            }
+        });
+
+        if enabled {
+            btn.on_press(msg).into()
+        } else {
+            btn.into()
+        }
+    }
+
+    fn editor_menu_separator<'a>() -> Element<'a, Message> {
+        container(Space::new(Length::Fill, 1))
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BORDER)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_editor_context_menu(&self) -> Element<'_, Message> {
+        let has_selection = self.tabs.get(self.active_tab)
+            .and_then(|t| t.content.selection())
+            .is_some();
+
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+        // Undo / Redo
+        items.push(Self::editor_menu_btn("Undo", "Ctrl+Z", Message::UndoExplorerDelete, true));
+        items.push(Self::editor_menu_btn("Redo", "Ctrl+Y", Message::Redo, true));
+        items.push(Self::editor_menu_separator());
+
+        // Cut / Copy / Paste
+        items.push(Self::editor_menu_btn("Cut", "Ctrl+X", Message::EditorCut, has_selection));
+        items.push(Self::editor_menu_btn("Copy", "Ctrl+C", Message::EditorCopy, has_selection));
+        items.push(Self::editor_menu_btn("Paste", "Ctrl+V", Message::EditorPaste, true));
+        items.push(Self::editor_menu_separator());
+
+        // Select All
+        items.push(Self::editor_menu_btn("Select All", "Ctrl+A", Message::EditorSelectAll, true));
+
+        let menu_content = Column::with_children(items).width(Length::Fixed(220.0));
+
+        let x = self.editor_context_position.x;
+        let y = self.editor_context_position.y;
+
+        let menu_box = container(menu_content)
+            .padding(4)
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BG_MEDIUM)),
+                border: Border {
+                    color: colors::BORDER,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            });
+
+        column![
+            Space::with_height(Length::Fixed(y)),
+            row![
+                Space::with_width(Length::Fixed(x)),
+                menu_box,
+            ],
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     // ========================================================================
