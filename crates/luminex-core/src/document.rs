@@ -7,7 +7,7 @@
 //! - Encapsulation: Can change the underlying type without breaking APIs
 //! - Documentation: The type name explains its purpose
 
-use luminex_buffer::{Cursor, MultiCursor, Position, TextBuffer};
+use luminex_buffer::{MultiCursor, Position, TextBuffer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,9 +68,11 @@ pub struct Document {
     line_ending: LineEnding,
 
     /// Encoding
+    #[allow(dead_code)]
     encoding: String,
 
     /// Tab settings
+    #[allow(dead_code)]
     tab_config: TabConfig,
 }
 

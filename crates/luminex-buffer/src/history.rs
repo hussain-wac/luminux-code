@@ -147,6 +147,7 @@ impl EditGroup {
     }
 
     /// Returns the last edit in the group.
+    #[allow(dead_code)]
     pub fn last(&self) -> Option<&Edit> {
         self.edits.last()
     }
@@ -260,7 +261,7 @@ impl History {
         if let Some(group) = self.undo_stack.back_mut() {
             if let Some(edit) = group.edits.pop() {
                 // Move to redo stack
-                let mut redo_group = EditGroup {
+                let redo_group = EditGroup {
                     edits: vec![edit.clone()],
                     timestamp: None,
                 };

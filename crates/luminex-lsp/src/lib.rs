@@ -29,7 +29,6 @@
 //! This is a placeholder implementation. Full LSP support will be added in Phase 3.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 // Re-export LSP types
 pub use lsp_types;

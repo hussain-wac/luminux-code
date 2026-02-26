@@ -69,6 +69,7 @@ enum TokenKind {
     Macro,
     Lifetime,
     Tag,
+    #[allow(dead_code)]
     Property,
     Variable,
     Default,
@@ -557,6 +558,7 @@ struct LangConfig {
     has_triple_quote_strings: bool,
     has_hash_comments: bool,
     has_double_dash_comments: bool,
+    #[allow(dead_code)]
     has_lifetimes: bool,
     has_macros: bool,
     has_attributes: bool,
@@ -1160,7 +1162,7 @@ impl EditorHighlighter {
                         let start = i;
                         i += 1;
                         // Check if it's a char literal like 'a' or a lifetime like 'a
-                        let word_start = i;
+                        let _word_start = i;
                         while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                             i += 1;
                         }

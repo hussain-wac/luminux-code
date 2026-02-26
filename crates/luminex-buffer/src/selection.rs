@@ -133,6 +133,7 @@ impl Default for Selection {
 }
 
 /// Represents the direction of a selection.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionDirection {
     /// Selection extends forward (cursor at end)
@@ -145,6 +146,7 @@ pub enum SelectionDirection {
 ///
 /// This preserves whether the user selected forward or backward,
 /// which affects where the cursor appears and how selection extends.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectedSelection {
     /// The anchor point (where selection started)
@@ -153,6 +155,7 @@ pub struct DirectedSelection {
     pub active: Position,
 }
 
+#[allow(dead_code)]
 impl DirectedSelection {
     /// Creates a new directed selection.
     pub fn new(anchor: Position, active: Position) -> Self {
@@ -203,12 +206,14 @@ impl DirectedSelection {
 }
 
 /// A collection of selections for multi-cursor editing.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SelectionSet {
     selections: Vec<DirectedSelection>,
     primary_index: usize,
 }
 
+#[allow(dead_code)]
 impl SelectionSet {
     /// Creates a new selection set with a single cursor at the origin.
     pub fn new() -> Self {

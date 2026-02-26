@@ -10,6 +10,9 @@ use iced::widget::{
 use iced::{Background, Border, Color, Element, Font, Length, Padding, Point, Subscription, Task, Theme};
 use std::path::{Path, PathBuf};
 
+// PTY terminal support
+extern crate libc;
+
 use crate::highlighter::{detect_language, EditorHighlighter, HighlightSettings};
 
 // ============================================================================
@@ -103,6 +106,7 @@ struct TabInfo {
     // Undo/redo history
     undo_stack: Vec<String>,
     redo_stack: Vec<String>,
+    #[allow(dead_code)]
     last_saved_content: String,
 }
 
@@ -193,6 +197,7 @@ pub struct ContextMenu {
     visible: bool,
     position: Point,
     target: Option<PathBuf>,
+    #[allow(dead_code)]
     is_directory: bool,
 }
 
@@ -311,16 +316,28 @@ pub struct App {
     goto_line_input: String,
     /// Whether the About modal is visible.
     about_visible: bool,
+    /// Whether the right dock (minimap/outline) is visible.
+    right_dock_visible: bool,
+    /// Whether the outline panel is visible (shown in right dock).
+    outline_visible: bool,
+    /// Whether the diagnostics panel is visible (shown in bottom dock).
+    diagnostics_visible: bool,
+    /// Diagnostics messages collected from the editor.
+    diagnostics_messages: Vec<String>,
     /// Whether the integrated terminal is visible.
     terminal_visible: bool,
     /// Terminal output lines.
     terminal_output: Vec<String>,
-    /// Terminal input buffer.
-    terminal_input: String,
-    /// Terminal working directory.
-    terminal_cwd: PathBuf,
     /// Terminal height in pixels.
     terminal_height: f32,
+    /// PTY master file descriptor (raw fd) for writing to the shell. -1 means not spawned.
+    terminal_pty_fd: i32,
+    /// Whether the PTY shell has been spawned.
+    terminal_spawned: bool,
+    /// Whether the terminal panel has keyboard focus (keys go to PTY).
+    terminal_focused: bool,
+    /// Editor scroll offset in lines (tracked from EditorAction::Scroll).
+    editor_scroll_offset: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +426,19 @@ pub enum Message {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ZoomResetAll,
+
+    // Dock toggles
+    ToggleLeftDock,
+    ToggleRightDock,
+    ToggleBottomDock,
+    ToggleAllDocks,
+
+    // Panels
+    ToggleProjectPanel,
+    ToggleOutlinePanel,
+    ToggleTerminalPanel,
+    ToggleDiagnostics,
 
     // Go to Line
     ShowGotoLine,
@@ -427,11 +457,16 @@ pub enum Message {
     HideAbout,
 
     // Terminal
-    ToggleTerminal,
-    TerminalInputChanged(String),
-    TerminalSubmit,
     TerminalOutput(String),
     TerminalClear,
+    TerminalSpawned(i32),
+    TerminalTick,
+    TerminalFocused,
+    TerminalUnfocused,
+    /// Raw key input to send to PTY (character bytes).
+    TerminalKeyInput(String),
+    /// Raw key press event for routing (terminal vs editor).
+    KeyPressed(keyboard::Key, keyboard::Modifiers),
 
     // Async results
     FileOpened(Result<(PathBuf, String), String>),
@@ -469,11 +504,17 @@ impl App {
             goto_line_visible: false,
             goto_line_input: String::new(),
             about_visible: false,
+            right_dock_visible: true,
+            outline_visible: false,
+            diagnostics_visible: false,
+            diagnostics_messages: Vec::new(),
             terminal_visible: false,
-            terminal_output: vec!["Welcome to Luminex Terminal. Type commands and press Enter.".to_string()],
-            terminal_input: String::new(),
-            terminal_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            terminal_height: 200.0,
+            terminal_output: Vec::new(),
+            terminal_height: 250.0,
+            terminal_pty_fd: -1,
+            terminal_spawned: false,
+            terminal_focused: false,
+            editor_scroll_offset: 0.0,
         };
 
         // Set initial content with sample Rust code
@@ -717,10 +758,34 @@ impl Config {
             }
 
             Message::EditorAction(action) => {
-                // Close any open context menus when the editor is interacted with
+                // If the editor context menu is visible and this is a click/drag,
+                // just close the context menu but DON'T perform the click action
+                // so the selection is preserved (dimmed highlight stays).
+                if self.editor_context_visible {
+                    match &action {
+                        text_editor::Action::Click(_) | text_editor::Action::Drag(_) => {
+                            self.editor_context_visible = false;
+                            self.context_menu.visible = false;
+                            self.active_menu = None;
+                            // Don't perform the action - selection stays
+                            return Task::none();
+                        }
+                        _ => {
+                            // For other actions (typing, scroll, etc.) close menu and proceed
+                            self.editor_context_visible = false;
+                        }
+                    }
+                }
+
+                // Close other menus on editor interaction, unfocus terminal
                 self.context_menu.visible = false;
-                self.editor_context_visible = false;
                 self.active_menu = None;
+                self.terminal_focused = false;
+
+                // Track scroll offset for scrollbar
+                if let text_editor::Action::Scroll { lines } = &action {
+                    self.editor_scroll_offset = (self.editor_scroll_offset + *lines as f32).max(0.0);
+                }
 
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let is_edit = action.is_edit();
@@ -735,6 +800,10 @@ impl Config {
                     if is_edit {
                         tab.modified = true;
                     }
+
+                    // Clamp scroll offset to valid range
+                    let max_scroll = (tab.content.line_count() as f32 - 1.0).max(0.0);
+                    self.editor_scroll_offset = self.editor_scroll_offset.clamp(0.0, max_scroll);
                 }
             }
 
@@ -744,6 +813,7 @@ impl Config {
                 self.active_menu = None;
                 if idx < self.tabs.len() {
                     self.active_tab = idx;
+                    self.editor_scroll_offset = 0.0;
                     let name = self.tabs[idx].name.clone();
                     self.status_message = format!("Editing: {}", name);
                 }
@@ -1295,6 +1365,130 @@ impl Config {
                 self.font_size = 14.0;
                 self.status_message = "Zoom reset to 14px".to_string();
             }
+            Message::ZoomResetAll => {
+                self.active_menu = None;
+                self.font_size = 14.0;
+                self.status_message = "All zoom reset to 14px".to_string();
+            }
+
+            // Dock toggles
+            Message::ToggleLeftDock => {
+                self.active_menu = None;
+                self.sidebar_visible = !self.sidebar_visible;
+                self.status_message = if self.sidebar_visible {
+                    "Left dock shown".to_string()
+                } else {
+                    "Left dock hidden".to_string()
+                };
+            }
+            Message::ToggleRightDock => {
+                self.active_menu = None;
+                self.right_dock_visible = !self.right_dock_visible;
+                self.status_message = if self.right_dock_visible {
+                    "Right dock shown".to_string()
+                } else {
+                    "Right dock hidden".to_string()
+                };
+            }
+            Message::ToggleBottomDock => {
+                self.active_menu = None;
+                self.terminal_visible = !self.terminal_visible;
+                self.diagnostics_visible = false;
+                if self.terminal_visible {
+                    if !self.terminal_spawned {
+                        match Self::spawn_pty_shell(self.current_folder.as_deref()) {
+                            Ok(master_fd) => {
+                                self.terminal_pty_fd = master_fd;
+                                self.terminal_spawned = true;
+                                self.terminal_output.clear();
+                            }
+                            Err(e) => {
+                                self.terminal_output.push(format!("Failed to spawn terminal: {}", e));
+                            }
+                        }
+                    }
+                    self.terminal_focused = true;
+                    self.status_message = "Bottom dock shown".to_string();
+                } else {
+                    self.terminal_focused = false;
+                    self.status_message = "Bottom dock hidden".to_string();
+                }
+            }
+            Message::ToggleAllDocks => {
+                self.active_menu = None;
+                let any_visible = self.sidebar_visible || self.right_dock_visible || self.terminal_visible || self.diagnostics_visible;
+                if any_visible {
+                    self.sidebar_visible = false;
+                    self.right_dock_visible = false;
+                    self.terminal_visible = false;
+                    self.diagnostics_visible = false;
+                    self.status_message = "All docks hidden".to_string();
+                } else {
+                    self.sidebar_visible = true;
+                    self.right_dock_visible = true;
+                    self.status_message = "All docks shown".to_string();
+                }
+            }
+
+            // Panels
+            Message::ToggleProjectPanel => {
+                self.active_menu = None;
+                self.sidebar_visible = !self.sidebar_visible;
+                self.status_message = if self.sidebar_visible {
+                    "Project panel shown".to_string()
+                } else {
+                    "Project panel hidden".to_string()
+                };
+            }
+            Message::ToggleOutlinePanel => {
+                self.active_menu = None;
+                self.outline_visible = !self.outline_visible;
+                if self.outline_visible {
+                    self.right_dock_visible = true;
+                }
+                self.status_message = if self.outline_visible {
+                    "Outline panel shown".to_string()
+                } else {
+                    "Outline panel hidden".to_string()
+                };
+            }
+            Message::ToggleTerminalPanel => {
+                self.active_menu = None;
+                self.terminal_visible = !self.terminal_visible;
+                if self.terminal_visible {
+                    self.diagnostics_visible = false;
+                    // Spawn PTY shell if not already spawned
+                    if !self.terminal_spawned {
+                        match Self::spawn_pty_shell(self.current_folder.as_deref()) {
+                            Ok(master_fd) => {
+                                self.terminal_pty_fd = master_fd;
+                                self.terminal_spawned = true;
+                                self.terminal_output.clear();
+                            }
+                            Err(e) => {
+                                self.terminal_output.push(format!("Failed to spawn terminal: {}", e));
+                            }
+                        }
+                    }
+                    self.terminal_focused = true;
+                    self.status_message = "Terminal panel shown".to_string();
+                } else {
+                    self.terminal_focused = false;
+                    self.status_message = "Terminal panel hidden".to_string();
+                }
+            }
+            Message::ToggleDiagnostics => {
+                self.active_menu = None;
+                self.diagnostics_visible = !self.diagnostics_visible;
+                if self.diagnostics_visible {
+                    self.terminal_visible = false;
+                }
+                self.status_message = if self.diagnostics_visible {
+                    "Diagnostics panel shown".to_string()
+                } else {
+                    "Diagnostics panel hidden".to_string()
+                };
+            }
 
             // Go to Line
             Message::ShowGotoLine => {
@@ -1354,109 +1548,233 @@ impl Config {
             }
 
             // Terminal
-            Message::ToggleTerminal => {
-                self.active_menu = None;
-                self.terminal_visible = !self.terminal_visible;
-                if self.terminal_visible {
-                    // Set terminal cwd to project folder if available
-                    if let Some(folder) = &self.current_folder {
-                        self.terminal_cwd = folder.clone();
-                    }
-                    self.status_message = "Terminal opened".to_string();
-                } else {
-                    self.status_message = "Terminal closed".to_string();
-                }
-            }
-            Message::TerminalInputChanged(val) => {
-                self.terminal_input = val;
-            }
-            Message::TerminalSubmit => {
-                let cmd = self.terminal_input.trim().to_string();
-                if cmd.is_empty() {
-                    return Task::none();
-                }
-                self.terminal_input.clear();
-
-                // Display the command
-                let prompt = format!("$ {}", cmd);
-                self.terminal_output.push(prompt);
-
-                // Handle built-in commands
-                if cmd == "clear" || cmd == "cls" {
-                    self.terminal_output.clear();
-                    return Task::none();
-                }
-
-                if cmd.starts_with("cd ") {
-                    let dir = cmd[3..].trim();
-                    let new_path = if dir.starts_with('/') {
-                        PathBuf::from(dir)
-                    } else if dir == "~" {
-                        std::env::var("HOME").map(PathBuf::from).unwrap_or(self.terminal_cwd.clone())
-                    } else {
-                        self.terminal_cwd.join(dir)
-                    };
-                    if new_path.is_dir() {
-                        self.terminal_cwd = new_path.canonicalize().unwrap_or(new_path);
-                    } else {
-                        self.terminal_output.push(format!("cd: {}: No such directory", dir));
-                    }
-                    return Task::none();
-                }
-
-                // Execute external command
-                let cwd = self.terminal_cwd.clone();
-                return Task::perform(
-                    async move {
-                        let output = tokio::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(&cmd)
-                            .current_dir(&cwd)
-                            .output()
-                            .await;
-
-                        match output {
-                            Ok(out) => {
-                                let mut result = String::new();
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                let stderr = String::from_utf8_lossy(&out.stderr);
-                                if !stdout.is_empty() {
-                                    result.push_str(&stdout);
-                                }
-                                if !stderr.is_empty() {
-                                    if !result.is_empty() {
-                                        result.push('\n');
-                                    }
-                                    result.push_str(&stderr);
-                                }
-                                if result.is_empty() {
-                                    result = "(no output)".to_string();
-                                }
-                                result
-                            }
-                            Err(e) => format!("Error: {}", e),
-                        }
-                    },
-                    Message::TerminalOutput,
-                );
-            }
             Message::TerminalOutput(output) => {
-                // Split output into lines and add to terminal
-                for line in output.lines() {
-                    self.terminal_output.push(line.to_string());
-                }
-                // Limit terminal output buffer
-                if self.terminal_output.len() > 1000 {
-                    let drain_count = self.terminal_output.len() - 1000;
-                    self.terminal_output.drain(0..drain_count);
+                if !output.is_empty() {
+                    self.terminal_output.push(output);
+                    // Limit buffer
+                    if self.terminal_output.len() > 5000 {
+                        let drain_count = self.terminal_output.len() - 5000;
+                        self.terminal_output.drain(0..drain_count);
+                    }
                 }
             }
             Message::TerminalClear => {
                 self.terminal_output.clear();
             }
+            Message::TerminalSpawned(fd) => {
+                self.terminal_pty_fd = fd;
+                self.terminal_spawned = true;
+            }
+            Message::TerminalTick => {
+                // Read available data from PTY master
+                if self.terminal_pty_fd >= 0 {
+                    let fd = self.terminal_pty_fd;
+                    let mut buf = [0u8; 8192];
+                    let mut got_data = false;
+                    loop {
+                        let n = unsafe {
+                            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        };
+                        if n > 0 {
+                            got_data = true;
+                            let raw = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+                            let cleaned = Self::strip_ansi(&raw);
+
+                            // Split into lines, appending to the last incomplete line
+                            let lines: Vec<&str> = cleaned.split('\n').collect();
+                            if let Some(first) = lines.first() {
+                                // Append to last line if it exists (continuation of incomplete line)
+                                if let Some(last_line) = self.terminal_output.last_mut() {
+                                    last_line.push_str(first);
+                                } else {
+                                    self.terminal_output.push(first.to_string());
+                                }
+                                // Remaining lines are new complete lines
+                                for line in &lines[1..] {
+                                    self.terminal_output.push(line.to_string());
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if got_data {
+                        // Limit buffer to 5000 lines
+                        if self.terminal_output.len() > 5000 {
+                            let drain_count = self.terminal_output.len() - 5000;
+                            self.terminal_output.drain(0..drain_count);
+                        }
+                    }
+                }
+            }
+            Message::TerminalFocused => {
+                self.terminal_focused = true;
+            }
+            Message::TerminalUnfocused => {
+                self.terminal_focused = false;
+            }
+            Message::TerminalKeyInput(data) => {
+                self.pty_write(data.as_bytes());
+            }
+
+            Message::KeyPressed(key, modifiers) => {
+                return self.handle_key_pressed(key, modifiers);
+            }
 
         }
         Task::none()
+    }
+
+    /// Route key presses based on whether terminal is focused.
+    fn handle_key_pressed(&mut self, key: keyboard::Key, modifiers: keyboard::Modifiers) -> Task<Message> {
+        // --- Ctrl shortcuts ---
+        if modifiers.control() {
+            let char_key = match &key {
+                keyboard::Key::Character(c) => Some(c.to_lowercase()),
+                _ => None,
+            };
+
+            if let Some(c) = char_key {
+                // Ctrl+Shift combinations (always active)
+                if modifiers.shift() {
+                    match c.as_str() {
+                        "s" => return self.update(Message::SaveAs),
+                        "z" => return self.update(Message::Redo),
+                        "e" => return self.update(Message::ToggleProjectPanel),
+                        "b" => return self.update(Message::ToggleOutlinePanel),
+                        "m" => return self.update(Message::ToggleDiagnostics),
+                        _ => {}
+                    }
+                }
+
+                // Ctrl+Alt combinations (always active)
+                if modifiers.alt() {
+                    match c.as_str() {
+                        "b" => return self.update(Message::ToggleRightDock),
+                        "y" => return self.update(Message::ToggleAllDocks),
+                        _ => {}
+                    }
+                }
+
+                // Ctrl-only combinations
+                if !modifiers.shift() && !modifiers.alt() {
+                    // App-level shortcuts always work
+                    match c.as_str() {
+                        "`" => return self.update(Message::ToggleTerminalPanel),
+                        "j" => return self.update(Message::ToggleBottomDock),
+                        "q" => return self.update(Message::CloseWindow),
+                        _ => {}
+                    }
+
+                    if self.terminal_focused {
+                        // Send Ctrl+key as control character to PTY
+                        let ctrl_char = match c.as_str() {
+                            "c" => Some("\x03"),
+                            "d" => Some("\x04"),
+                            "z" => Some("\x1a"),
+                            "l" => Some("\x0c"),
+                            "a" => Some("\x01"),
+                            "e" => Some("\x05"),
+                            "u" => Some("\x15"),
+                            "k" => Some("\x0b"),
+                            "w" => Some("\x17"),
+                            "r" => Some("\x12"),
+                            "p" => Some("\x10"),
+                            "n" => Some("\x0e"),
+                            _ => None,
+                        };
+                        if let Some(ch) = ctrl_char {
+                            self.pty_write(ch.as_bytes());
+                        }
+                    } else {
+                        // Editor shortcuts
+                        match c.as_str() {
+                            "a" => return self.update(Message::EditorSelectAll),
+                            "n" => return self.update(Message::NewFile),
+                            "o" => return self.update(Message::OpenFile),
+                            "s" => return self.update(Message::Save),
+                            "w" => return self.update(Message::CloseCurrentTab),
+                            "z" => return self.update(Message::Undo),
+                            "y" => return self.update(Message::Redo),
+                            "g" => return self.update(Message::ShowGotoLine),
+                            "=" | "+" => return self.update(Message::ZoomIn),
+                            "-" => return self.update(Message::ZoomOut),
+                            "0" => return self.update(Message::ZoomReset),
+                            "b" => return self.update(Message::ToggleLeftDock),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // Ctrl+Tab switching (only when not in terminal)
+            if !self.terminal_focused {
+                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
+                    if modifiers.shift() {
+                        return self.update(Message::PrevTab);
+                    } else {
+                        return self.update(Message::NextTab);
+                    }
+                }
+            } else {
+                // Ctrl+Tab in terminal: send tab to PTY
+                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
+                    self.pty_write(b"\t");
+                }
+            }
+
+            return Task::none();
+        }
+
+        // --- Non-Ctrl keys ---
+        if self.terminal_focused {
+            match &key {
+                keyboard::Key::Character(c) => {
+                    self.pty_write(c.as_bytes());
+                }
+                keyboard::Key::Named(named) => {
+                    let seq = match named {
+                        keyboard::key::Named::Enter => Some("\n"),
+                        keyboard::key::Named::Backspace => Some("\x7f"),
+                        keyboard::key::Named::Tab => Some("\t"),
+                        keyboard::key::Named::Escape => Some("\x1b"),
+                        keyboard::key::Named::ArrowUp => Some("\x1b[A"),
+                        keyboard::key::Named::ArrowDown => Some("\x1b[B"),
+                        keyboard::key::Named::ArrowRight => Some("\x1b[C"),
+                        keyboard::key::Named::ArrowLeft => Some("\x1b[D"),
+                        keyboard::key::Named::Home => Some("\x1b[H"),
+                        keyboard::key::Named::End => Some("\x1b[F"),
+                        keyboard::key::Named::Delete => Some("\x1b[3~"),
+                        keyboard::key::Named::PageUp => Some("\x1b[5~"),
+                        keyboard::key::Named::PageDown => Some("\x1b[6~"),
+                        keyboard::key::Named::Space => Some(" "),
+                        _ => None,
+                    };
+                    if let Some(s) = seq {
+                        self.pty_write(s.as_bytes());
+                    }
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        // Escape to close modals/menus (when terminal not focused)
+        if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+            return self.update(Message::CloseTopMenu);
+        }
+
+        Task::none()
+    }
+
+    /// Write raw bytes to the PTY master fd.
+    fn pty_write(&self, data: &[u8]) {
+        if self.terminal_pty_fd >= 0 {
+            let fd = self.terminal_pty_fd;
+            unsafe {
+                libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+            }
+        }
     }
 
     fn refresh_file_tree(&mut self) {
@@ -1496,6 +1814,140 @@ impl Config {
         }
     }
 
+    /// Spawn a PTY shell process (bash or sh). Returns the master fd on success.
+    fn spawn_pty_shell(cwd: Option<&Path>) -> Result<i32, String> {
+        use nix::pty::openpty;
+        use std::os::unix::io::AsRawFd;
+
+        // Open a PTY pair
+        let pty = openpty(None, None).map_err(|e| format!("openpty failed: {}", e))?;
+        let master_fd = pty.master.as_raw_fd();
+        let slave_fd = pty.slave.as_raw_fd();
+
+        // Fork
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err("fork failed".to_string());
+        }
+
+        if pid == 0 {
+            // Child process
+            unsafe {
+                // Create a new session
+                libc::setsid();
+
+                // Set the slave as the controlling terminal
+                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+
+                // Redirect stdin/stdout/stderr to slave
+                libc::dup2(slave_fd, 0);
+                libc::dup2(slave_fd, 1);
+                libc::dup2(slave_fd, 2);
+
+                // Close the master and original slave fds
+                libc::close(master_fd);
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+
+                // Set working directory
+                if let Some(dir) = cwd {
+                    if let Ok(dir_cstr) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
+                        libc::chdir(dir_cstr.as_ptr());
+                    }
+                }
+
+                // Set environment variables
+                let term = std::ffi::CString::new("TERM=xterm-256color").unwrap();
+                libc::putenv(term.as_ptr() as *mut _);
+
+                // Set terminal size (rows=24, cols=120)
+                let ws = libc::winsize {
+                    ws_row: 24,
+                    ws_col: 120,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                libc::ioctl(0, libc::TIOCSWINSZ, &ws);
+
+                // Execute shell
+                let shell = std::ffi::CString::new("/bin/bash").unwrap();
+                let arg0 = std::ffi::CString::new("bash").unwrap();
+                let args = [arg0.as_ptr(), std::ptr::null()];
+                libc::execvp(shell.as_ptr(), args.as_ptr());
+
+                // If bash fails, try sh
+                let shell = std::ffi::CString::new("/bin/sh").unwrap();
+                let arg0 = std::ffi::CString::new("sh").unwrap();
+                let args = [arg0.as_ptr(), std::ptr::null()];
+                libc::execvp(shell.as_ptr(), args.as_ptr());
+
+                libc::_exit(1);
+            }
+        }
+
+        // Parent process: close the slave fd, set master to non-blocking
+        unsafe {
+            libc::close(slave_fd);
+            let flags = libc::fcntl(master_fd, libc::F_GETFL);
+            libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Leak the OwnedFd so it doesn't close when dropped
+        std::mem::forget(pty.master);
+        std::mem::forget(pty.slave);
+
+        Ok(master_fd)
+    }
+
+    /// Strip ANSI escape sequences from terminal output.
+    fn strip_ansi(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // ESC sequence - skip until we find the terminator
+                if let Some(&next) = chars.peek() {
+                    if next == '[' {
+                        chars.next(); // consume '['
+                        // CSI sequence: skip until we find a letter (0x40-0x7E)
+                        while let Some(&ch) = chars.peek() {
+                            chars.next();
+                            if ch.is_ascii_alphabetic() || ch == '~' || ch == '@' {
+                                break;
+                            }
+                        }
+                    } else if next == ']' {
+                        chars.next(); // consume ']'
+                        // OSC sequence: skip until BEL or ST
+                        while let Some(&ch) = chars.peek() {
+                            chars.next();
+                            if ch == '\x07' {
+                                break;
+                            }
+                            if ch == '\x1b' {
+                                if let Some(&'\\') = chars.peek() {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                        }
+                    } else if next == '(' || next == ')' {
+                        chars.next(); // consume '(' or ')'
+                        chars.next(); // consume charset designator
+                    } else {
+                        chars.next(); // consume single char after ESC
+                    }
+                }
+            } else if c == '\r' {
+                // Skip carriage returns
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
     fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dst)?;
         for entry in std::fs::read_dir(src)? {
@@ -1513,60 +1965,19 @@ impl Config {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        keyboard::on_key_press(|key, modifiers| {
-            if modifiers.control() {
-                let char_key = match &key {
-                    keyboard::Key::Character(c) => Some(c.to_lowercase()),
-                    _ => None,
-                };
+        // Use a plain fn pointer (no captures) — all routing happens in update()
+        let keyboard_sub = keyboard::on_key_press(|key, modifiers| {
+            Some(Message::KeyPressed(key, modifiers))
+        });
 
-                if let Some(c) = char_key {
-                    match c.as_str() {
-                        "n" => return Some(Message::NewFile),
-                        "o" => return Some(Message::OpenFile),
-                        "s" => {
-                            if modifiers.shift() {
-                                return Some(Message::SaveAs);
-                            } else {
-                                return Some(Message::Save);
-                            }
-                        }
-                        "w" => return Some(Message::CloseCurrentTab),
-                        "z" => {
-                            if modifiers.shift() {
-                                return Some(Message::Redo);
-                            } else {
-                                return Some(Message::Undo);
-                            }
-                        }
-                        "y" => return Some(Message::Redo),
-                        "g" => return Some(Message::ShowGotoLine),
-                        "q" => return Some(Message::CloseWindow),
-                        "=" | "+" => return Some(Message::ZoomIn),
-                        "-" => return Some(Message::ZoomOut),
-                        "0" => return Some(Message::ZoomReset),
-                        "`" => return Some(Message::ToggleTerminal),
-                        _ => {}
-                    }
-                }
-
-                // Tab switching
-                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Tab)) {
-                    if modifiers.shift() {
-                        return Some(Message::PrevTab);
-                    } else {
-                        return Some(Message::NextTab);
-                    }
-                }
-            }
-
-            // Escape to close modals/menus
-            if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                return Some(Message::CloseTopMenu);
-            }
-
-            None
-        })
+        // Poll PTY output periodically when terminal is active
+        if self.terminal_spawned && self.terminal_visible {
+            let pty_poll = iced::time::every(std::time::Duration::from_millis(50))
+                .map(|_| Message::TerminalTick);
+            Subscription::batch([keyboard_sub, pty_poll])
+        } else {
+            keyboard_sub
+        }
     }
 
     fn toggle_folder_recursive(node: &mut FileNode, target: &Path) {
@@ -2356,13 +2767,28 @@ impl Config {
                 items.push(Self::menu_item("Select Line", "", Message::SelectLine));
             }
             TopMenu::View => {
-                items.push(Self::menu_item("Toggle Sidebar", "", Message::ToggleSidebar));
-                items.push(Self::menu_item("Toggle Minimap", "", Message::ToggleMinimap));
-                items.push(Self::menu_item("Toggle Terminal", "Ctrl+`", Message::ToggleTerminal));
-                items.push(Self::menu_separator());
-                items.push(Self::menu_item("Zoom In", "Ctrl+=", Message::ZoomIn));
+                // Zoom
+                items.push(Self::menu_item("Zoom In", "Ctrl++", Message::ZoomIn));
                 items.push(Self::menu_item("Zoom Out", "Ctrl+-", Message::ZoomOut));
                 items.push(Self::menu_item("Reset Zoom", "Ctrl+0", Message::ZoomReset));
+                items.push(Self::menu_item("Reset All Zoom", "", Message::ZoomResetAll));
+                items.push(Self::menu_separator());
+
+                // Dock toggles
+                items.push(Self::menu_item("Toggle Left Dock", "Ctrl+B", Message::ToggleLeftDock));
+                items.push(Self::menu_item("Toggle Right Dock", "Ctrl+Alt+B", Message::ToggleRightDock));
+                items.push(Self::menu_item("Toggle Bottom Dock", "Ctrl+J", Message::ToggleBottomDock));
+                items.push(Self::menu_item("Toggle All Docks", "Ctrl+Alt+Y", Message::ToggleAllDocks));
+                items.push(Self::menu_separator());
+
+                // Panels
+                items.push(Self::menu_item("Project Panel", "Ctrl+Shift+E", Message::ToggleProjectPanel));
+                items.push(Self::menu_item("Outline Panel", "Ctrl+Shift+B", Message::ToggleOutlinePanel));
+                items.push(Self::menu_item("Terminal Panel", "Ctrl+`", Message::ToggleTerminalPanel));
+                items.push(Self::menu_separator());
+
+                // Diagnostics
+                items.push(Self::menu_item("Diagnostics", "Ctrl+Shift+M", Message::ToggleDiagnostics));
             }
             TopMenu::Go => {
                 items.push(Self::menu_item("Go to Line...", "Ctrl+G", Message::ShowGotoLine));
@@ -2378,7 +2804,7 @@ impl Config {
             }
         }
 
-        let menu_width = 240.0;
+        let menu_width = 280.0;
         let menu_content = Column::with_children(items)
             .width(Length::Fixed(menu_width))
             .padding(4);
@@ -2628,26 +3054,34 @@ impl Config {
     fn view_main_area(&self) -> Element<'_, Message> {
         let mut editor_row_items: Vec<Element<'_, Message>> = vec![self.view_editor()];
 
-        // Add minimap if visible
-        if self.minimap_visible {
-            editor_row_items.push(self.view_minimap());
-        }
-
         // Add scrollbar indicator
         editor_row_items.push(self.view_scrollbar());
 
-        let editor_with_minimap = Row::with_children(editor_row_items)
+        // Right dock: minimap and/or outline
+        if self.right_dock_visible {
+            if self.minimap_visible {
+                editor_row_items.push(self.view_minimap());
+            }
+            if self.outline_visible {
+                editor_row_items.push(self.view_outline_panel());
+            }
+        }
+
+        let editor_with_panels = Row::with_children(editor_row_items)
             .height(Length::Fill);
 
         let mut main_items: Vec<Element<'_, Message>> = vec![
             self.view_tabs(),
-            editor_with_minimap.into(),
+            editor_with_panels.into(),
         ];
 
-        // Add terminal if visible
+        // Bottom dock: terminal or diagnostics
         if self.terminal_visible {
-            main_items.push(self.view_terminal_divider());
+            main_items.push(self.view_dock_divider());
             main_items.push(self.view_terminal());
+        } else if self.diagnostics_visible {
+            main_items.push(self.view_dock_divider());
+            main_items.push(self.view_diagnostics_panel());
         }
 
         Column::with_children(main_items)
@@ -2774,6 +3208,8 @@ impl Config {
                 Color::from_rgba(0.25, 0.46, 0.85, 0.55)
             };
 
+            let editor_bg = colors::BG_DARK;
+
             let editor = text_editor(&tab.content)
                 .height(Length::Fill)
                 .padding(16)
@@ -2781,7 +3217,7 @@ impl Config {
                 .size(self.font_size)
                 .style(move |_theme: &Theme, _status| {
                     text_editor::Style {
-                        background: Background::Color(colors::BG_DARK),
+                        background: Background::Color(editor_bg),
                         border: Border {
                             width: 0.0,
                             radius: 0.0.into(),
@@ -2826,57 +3262,79 @@ impl Config {
     // ========================================================================
 
     fn view_scrollbar(&self) -> Element<'_, Message> {
+        let track_bg = Color::from_rgb(0.12, 0.12, 0.14);
+        let thumb_color = Color::from_rgba(0.60, 0.60, 0.65, 0.7);
+        let width = 14.0_f32;
+        // Use a fixed track pixel height for calculations.
+        // The actual container will stretch to Length::Fill, but
+        // we use this to compute the thumb's fixed pixel sizes.
+        let track_px = 700.0_f32;
+
         if let Some(tab) = self.tabs.get(self.active_tab) {
-            let total_lines = tab.content.line_count().max(1);
+            let total_lines = tab.content.line_count().max(1) as f32;
             let (cursor_line, _) = tab.content.cursor_position();
 
-            // Estimate visible lines based on font size (approximate)
-            let visible_lines = (400.0 / (self.font_size * 1.4)) as usize;
-            let visible_lines = visible_lines.max(10);
-
-            // Calculate thumb size and position
-            let thumb_ratio = (visible_lines as f32 / total_lines as f32).min(1.0);
-            let scroll_ratio = if total_lines > visible_lines {
-                cursor_line as f32 / (total_lines - 1).max(1) as f32
+            let effective_pos = if self.editor_scroll_offset > 0.0 {
+                self.editor_scroll_offset
             } else {
-                0.0
+                cursor_line as f32
             };
 
-            let thumb_height_pct = (thumb_ratio * 100.0).max(8.0).min(100.0);
-            let thumb_top_pct = (scroll_ratio * (100.0 - thumb_height_pct)).max(0.0);
+            let line_height = self.font_size * 1.6;
+            let viewport_lines = (track_px / line_height).max(10.0);
 
-            // Build the scrollbar track with thumb
-            let track: Element<'_, Message> = container(
-                column![
-                    Space::with_height(Length::FillPortion((thumb_top_pct * 100.0) as u16 + 1)),
-                    container(Space::new(Length::Fill, Length::FillPortion((thumb_height_pct * 100.0) as u16 + 1)))
-                        .style(|_| container::Style {
-                            background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.15))),
-                            border: Border {
-                                radius: 3.0.into(),
-                                ..Default::default()
-                            },
+            // No thumb needed if all content fits
+            if total_lines <= viewport_lines + 5.0 {
+                return container(Space::new(width, Length::Fill))
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(track_bg)),
+                        ..Default::default()
+                    })
+                    .into();
+            }
+
+            // Thumb height: proportional to viewport/total
+            let thumb_frac = (viewport_lines / total_lines).clamp(0.05, 0.9);
+            let thumb_h = (thumb_frac * track_px).clamp(30.0, track_px - 10.0);
+
+            // Thumb position: how far down
+            let max_scroll = (total_lines - viewport_lines).max(1.0);
+            let pos_frac = (effective_pos / max_scroll).clamp(0.0, 1.0);
+            let top_space = (pos_frac * (track_px - thumb_h)).clamp(0.0, track_px - thumb_h);
+
+            // Build: a column with top spacer (fixed px), thumb (fixed px), rest fills
+            let track = column![
+                // Top spacer
+                Space::new(width, Length::Fixed(top_space)),
+                // Thumb
+                container(Space::new(width - 4.0, Length::Fixed(thumb_h)))
+                    .center_x(width)
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(thumb_color)),
+                        border: Border {
+                            radius: 4.0.into(),
                             ..Default::default()
-                        }),
-                    Space::with_height(Length::FillPortion(((100.0 - thumb_top_pct - thumb_height_pct) * 100.0) as u16 + 1)),
-                ]
-                .height(Length::Fill)
-            )
-            .width(Length::Fixed(12.0))
-            .height(Length::Fill)
-            .padding(Padding::from([2, 2]))
-            .style(|_| container::Style {
-                background: Some(Background::Color(colors::BG_MEDIUM)),
-                ..Default::default()
-            })
-            .into();
+                        },
+                        ..Default::default()
+                    }),
+                // Bottom fills remaining
+                Space::new(width, Length::Fill),
+            ]
+            .width(Length::Fixed(width))
+            .height(Length::Fill);
 
-            track
+            container(track)
+                .width(Length::Fixed(width))
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(track_bg)),
+                    ..Default::default()
+                })
+                .into()
         } else {
-            // No file open, empty scrollbar area
-            container(Space::new(12, Length::Fill))
-                .style(|_| container::Style {
-                    background: Some(Background::Color(colors::BG_MEDIUM)),
+            container(Space::new(width, Length::Fill))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(track_bg)),
                     ..Default::default()
                 })
                 .into()
@@ -2968,30 +3426,186 @@ impl Config {
     }
 
     // ========================================================================
-    // Terminal
+    // Outline Panel (right dock)
     // ========================================================================
 
-    fn view_terminal_divider(&self) -> Element<'_, Message> {
-        container(Space::new(Length::Fill, 1))
-            .width(Length::Fill)
+    fn view_outline_panel(&self) -> Element<'_, Message> {
+        let header = container(
+            row![
+                text("OUTLINE").size(11).color(colors::TEXT_SECONDARY).font(Font::MONOSPACE),
+                horizontal_space(),
+                button(text("x").size(11).color(colors::TEXT_MUTED))
+                    .padding(Padding::from([2, 6]))
+                    .style(|_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered => colors::BG_HOVER,
+                            _ => Color::TRANSPARENT,
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: colors::TEXT_PRIMARY,
+                            border: Border { radius: 2.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::ToggleOutlinePanel),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(Padding::from([8, 10]))
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(colors::BG_MEDIUM)),
+            ..Default::default()
+        });
+
+        // Extract simple outline from current file
+        let mut outline_items: Vec<Element<'_, Message>> = Vec::new();
+
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let line_count = tab.content.line_count();
+            for i in 0..line_count {
+                if let Some(line_ref) = tab.content.line(i) {
+                    let line: &str = &line_ref;
+                    let trimmed = line.trim();
+
+                    // Detect outline-worthy items
+                    let (icon, name) = if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ") {
+                        let fn_part = if let Some(pos) = trimmed.find("fn ") {
+                            &trimmed[pos + 3..]
+                        } else {
+                            trimmed
+                        };
+                        let name = fn_part.split('(').next().unwrap_or(fn_part).trim();
+                        ("fn", name.to_string())
+                    } else if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+                        let s = trimmed.split("struct ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == '{' || c == '<' || c == '(' || c.is_whitespace()).next().unwrap_or(s);
+                        ("S", name.to_string())
+                    } else if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+                        let s = trimmed.split("enum ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next().unwrap_or(s);
+                        ("E", name.to_string())
+                    } else if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+                        let s = if trimmed.starts_with("impl<") {
+                            trimmed.split('>').nth(1).unwrap_or("").trim()
+                        } else {
+                            &trimmed[5..]
+                        };
+                        let name = s.split(|c: char| c == '{' || c.is_whitespace()).next().unwrap_or(s);
+                        ("I", name.to_string())
+                    } else if trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ") {
+                        let s = trimmed.split("trait ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == '{' || c == '<' || c == ':' || c.is_whitespace()).next().unwrap_or(s);
+                        ("T", name.to_string())
+                    } else if trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ") {
+                        let s = trimmed.split("mod ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == '{' || c == ';' || c.is_whitespace()).next().unwrap_or(s);
+                        ("m", name.to_string())
+                    } else if trimmed.starts_with("const ") || trimmed.starts_with("pub const ") {
+                        let s = trimmed.split("const ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == ':' || c == '=' || c.is_whitespace()).next().unwrap_or(s);
+                        ("C", name.to_string())
+                    } else if trimmed.starts_with("type ") || trimmed.starts_with("pub type ") {
+                        let s = trimmed.split("type ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == '=' || c == '<' || c.is_whitespace()).next().unwrap_or(s);
+                        ("T", name.to_string())
+                    } else if trimmed.starts_with("function ") || trimmed.starts_with("export function ") || trimmed.starts_with("async function ") {
+                        let s = trimmed.split("function ").nth(1).unwrap_or("");
+                        let name = s.split('(').next().unwrap_or(s).trim();
+                        ("fn", name.to_string())
+                    } else if trimmed.starts_with("class ") || trimmed.starts_with("export class ") {
+                        let s = trimmed.split("class ").nth(1).unwrap_or("");
+                        let name = s.split(|c: char| c == '{' || c == '<' || c.is_whitespace()).next().unwrap_or(s);
+                        ("C", name.to_string())
+                    } else if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                        let s = if trimmed.starts_with("async def ") { &trimmed[10..] } else { &trimmed[4..] };
+                        let name = s.split('(').next().unwrap_or(s).trim();
+                        ("fn", name.to_string())
+                    } else {
+                        continue;
+                    };
+
+                    let line_num = i;
+                    let (cursor_line, _) = tab.content.cursor_position();
+                    let is_current = line_num == cursor_line;
+
+                    let icon_color = match icon {
+                        "fn" => Color::from_rgb(0.60, 0.80, 0.60),
+                        "S" | "C" => Color::from_rgb(0.80, 0.70, 0.40),
+                        "E" => Color::from_rgb(0.70, 0.55, 0.85),
+                        "I" => Color::from_rgb(0.50, 0.75, 0.90),
+                        "T" => Color::from_rgb(0.80, 0.60, 0.60),
+                        "m" => Color::from_rgb(0.60, 0.60, 0.80),
+                        _ => colors::TEXT_SECONDARY,
+                    };
+
+                    let name_color = if is_current { colors::ACCENT } else { colors::TEXT_PRIMARY };
+                    let bg = if is_current { colors::BG_ACTIVE } else { Color::TRANSPARENT };
+
+                    let item: Element<'_, Message> = container(
+                        row![
+                            text(icon).size(10).font(Font::MONOSPACE).color(icon_color),
+                            Space::with_width(6),
+                            text(name).size(11).color(name_color),
+                        ]
+                        .align_y(iced::Alignment::Center)
+                    )
+                    .padding(Padding::from([3, 10]))
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(bg)),
+                        ..Default::default()
+                    })
+                    .into();
+
+                    outline_items.push(item);
+                }
+            }
+        }
+
+        if outline_items.is_empty() {
+            outline_items.push(
+                container(text("No symbols found").size(11).color(colors::TEXT_MUTED))
+                    .padding(Padding::from([8, 10]))
+                    .into()
+            );
+        }
+
+        let outline_list = Column::with_children(outline_items)
+            .spacing(0)
+            .width(Length::Fill);
+
+        let content = column![
+            header,
+            scrollable(outline_list).height(Length::Fill),
+        ];
+
+        container(content)
+            .width(Length::Fixed(200.0))
+            .height(Length::Fill)
             .style(|_| container::Style {
-                background: Some(Background::Color(colors::BORDER)),
+                background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.14))),
+                border: Border {
+                    color: colors::BORDER,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
                 ..Default::default()
             })
             .into()
     }
 
-    fn view_terminal(&self) -> Element<'_, Message> {
-        // Terminal header
+    // ========================================================================
+    // Diagnostics Panel (bottom dock)
+    // ========================================================================
+
+    fn view_diagnostics_panel(&self) -> Element<'_, Message> {
         let header = container(
             row![
-                text("TERMINAL").size(11).color(colors::TEXT_SECONDARY).font(Font::MONOSPACE),
+                text("DIAGNOSTICS").size(11).color(colors::TEXT_SECONDARY).font(Font::MONOSPACE),
                 horizontal_space(),
-                text(self.terminal_cwd.display().to_string())
-                    .size(10)
-                    .color(colors::TEXT_MUTED)
-                    .font(Font::MONOSPACE),
-                Space::with_width(8),
                 button(text("Clear").size(10).color(colors::TEXT_SECONDARY).font(Font::MONOSPACE))
                     .padding(Padding::from([2, 8]))
                     .style(|_: &Theme, status: button::Status| {
@@ -3002,14 +3616,11 @@ impl Config {
                         button::Style {
                             background: Some(Background::Color(bg)),
                             text_color: colors::TEXT_SECONDARY,
-                            border: Border {
-                                radius: 3.0.into(),
-                                ..Default::default()
-                            },
+                            border: Border { radius: 3.0.into(), ..Default::default() },
                             ..Default::default()
                         }
                     })
-                    .on_press(Message::TerminalClear),
+                    .on_press(Message::ToggleDiagnostics),
                 Space::with_width(4),
                 button(text("x").size(11).color(colors::TEXT_MUTED))
                     .padding(Padding::from([2, 6]))
@@ -3021,14 +3632,11 @@ impl Config {
                         button::Style {
                             background: Some(Background::Color(bg)),
                             text_color: colors::TEXT_PRIMARY,
-                            border: Border {
-                                radius: 2.0.into(),
-                                ..Default::default()
-                            },
+                            border: Border { radius: 2.0.into(), ..Default::default() },
                             ..Default::default()
                         }
                     })
-                    .on_press(Message::ToggleTerminal),
+                    .on_press(Message::ToggleDiagnostics),
             ]
             .spacing(4)
             .align_y(iced::Alignment::Center),
@@ -3040,74 +3648,200 @@ impl Config {
             ..Default::default()
         });
 
-        // Terminal output
-        let mut output_items: Vec<Element<'_, Message>> = Vec::new();
-        for line in &self.terminal_output {
-            let line_color = if line.starts_with("$ ") {
-                colors::ACCENT
-            } else if line.starts_with("Error:") || line.starts_with("error") {
-                Color::from_rgb(0.90, 0.35, 0.35)
-            } else {
-                colors::TEXT_SECONDARY
-            };
-            output_items.push(
-                text(line).size(12).font(Font::MONOSPACE).color(line_color).into()
+        let mut diag_items: Vec<Element<'_, Message>> = Vec::new();
+
+        if self.diagnostics_messages.is_empty() {
+            diag_items.push(
+                container(
+                    text("No problems detected").size(12).font(Font::MONOSPACE).color(colors::TEXT_MUTED)
+                )
+                .padding(Padding::from([8, 12]))
+                .into()
             );
+        } else {
+            for msg in &self.diagnostics_messages {
+                let color = if msg.contains("error") || msg.contains("Error") {
+                    Color::from_rgb(0.90, 0.35, 0.35)
+                } else if msg.contains("warning") || msg.contains("Warning") {
+                    Color::from_rgb(0.90, 0.75, 0.30)
+                } else {
+                    colors::TEXT_SECONDARY
+                };
+                diag_items.push(
+                    text(msg.as_str()).size(12).font(Font::MONOSPACE).color(color).into()
+                );
+            }
         }
 
-        let output_column = Column::with_children(output_items)
-            .spacing(1)
+        let diag_column = Column::with_children(diag_items)
+            .spacing(2)
             .width(Length::Fill);
 
-        let output_scroll = scrollable(output_column)
-            .height(Length::Fill);
-
-        // Terminal input line
-        let prompt_display: String = format!("{}$", self.terminal_cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/".to_string()));
-
-        let input_line = row![
-            text(prompt_display).size(12).font(Font::MONOSPACE).color(colors::ACCENT),
-            Space::with_width(6),
-            text_input("Type a command...", &self.terminal_input)
-                .on_input(Message::TerminalInputChanged)
-                .on_submit(Message::TerminalSubmit)
-                .padding(Padding::from([4, 8]))
-                .size(12)
-                .font(Font::MONOSPACE),
-        ]
-        .align_y(iced::Alignment::Center)
-        .spacing(0);
-
-        let terminal_content = column![
+        let content = column![
             header,
-            container(output_scroll)
+            container(scrollable(diag_column).height(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .padding(Padding::from([4, 12])),
-            container(input_line)
-                .width(Length::Fill)
-                .padding(Padding::from([6, 12]))
-                .style(|_| container::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.09, 0.09, 0.11))),
-                    border: Border {
-                        color: colors::BORDER,
-                        width: 1.0,
-                        radius: 0.0.into(),
-                    },
-                    ..Default::default()
-                }),
         ];
 
-        container(terminal_content)
+        container(content)
             .width(Length::Fill)
             .height(Length::Fixed(self.terminal_height))
             .style(|_| container::Style {
                 background: Some(Background::Color(Color::from_rgb(0.08, 0.08, 0.10))),
                 ..Default::default()
             })
+            .into()
+    }
+
+    // ========================================================================
+    // Terminal
+    // ========================================================================
+
+    fn view_dock_divider(&self) -> Element<'_, Message> {
+        container(Space::new(Length::Fill, 1))
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BORDER)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_terminal(&self) -> Element<'_, Message> {
+        let term_bg = Color::from_rgb(0.07, 0.07, 0.09);
+        let term_header_bg = Color::from_rgb(0.10, 0.10, 0.12);
+
+        // Terminal tab bar (like the screenshot: tabs at top)
+        let tab_label = row![
+            text("bash").size(11).color(colors::TEXT_PRIMARY).font(Font::MONOSPACE),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+
+        let header = container(
+            row![
+                // Active tab
+                container(tab_label)
+                    .padding(Padding::from([5, 12]))
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(term_bg)),
+                        border: Border {
+                            color: colors::BORDER,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                horizontal_space(),
+                // Action buttons: + split close
+                button(text("+").size(12).color(colors::TEXT_MUTED).font(Font::MONOSPACE))
+                    .padding(Padding::from([2, 6]))
+                    .style(|_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered => colors::BG_HOVER,
+                            _ => Color::TRANSPARENT,
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: colors::TEXT_MUTED,
+                            border: Border { radius: 3.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::TerminalClear),
+                Space::with_width(2),
+                button(text("x").size(12).color(colors::TEXT_MUTED).font(Font::MONOSPACE))
+                    .padding(Padding::from([2, 6]))
+                    .style(|_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered => colors::BG_HOVER,
+                            _ => Color::TRANSPARENT,
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: colors::TEXT_MUTED,
+                            border: Border { radius: 3.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::ToggleTerminalPanel),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(Padding::from([4, 8]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(term_header_bg)),
+            border: Border {
+                color: colors::BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        });
+
+        // Terminal output area - all PTY output including prompts
+        let mut output_items: Vec<Element<'_, Message>> = Vec::new();
+        for line in &self.terminal_output {
+            // Color the prompt green, errors red, rest white
+            let line_color = if line.contains("error") || line.contains("Error") || line.contains("No such file") {
+                Color::from_rgb(0.90, 0.40, 0.40)
+            } else if line.contains('@') && line.contains('$') {
+                // Looks like a bash prompt
+                Color::from_rgb(0.40, 0.85, 0.40)
+            } else {
+                Color::from_rgb(0.82, 0.82, 0.84)
+            };
+            output_items.push(
+                text(line).size(13).font(Font::MONOSPACE).color(line_color).into()
+            );
+        }
+
+        let output_column = Column::with_children(output_items)
+            .spacing(2)
+            .width(Length::Fill);
+
+        let output_scroll = scrollable(output_column)
+            .height(Length::Fill)
+            .anchor_bottom();
+
+        // Focus indicator: colored left border when terminal has focus
+        let focus_border_color = if self.terminal_focused {
+            Color::from_rgb(0.25, 0.55, 0.95) // Blue accent when focused
+        } else {
+            Color::TRANSPARENT
+        };
+
+        let terminal_content = Column::new()
+            .push(header)
+            .push(
+                container(output_scroll)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(Padding::from([6, 12]))
+            )
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        let terminal_container = container(terminal_content)
+            .width(Length::Fill)
+            .height(Length::Fixed(self.terminal_height))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(term_bg)),
+                border: Border {
+                    color: focus_border_color,
+                    width: if focus_border_color == Color::TRANSPARENT { 0.0 } else { 2.0 },
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Wrap in mouse_area so clicking the terminal gives it keyboard focus
+        mouse_area(terminal_container)
+            .on_press(Message::TerminalFocused)
             .into()
     }
 

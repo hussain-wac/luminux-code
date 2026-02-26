@@ -31,3 +31,7 @@ rfd = "0.14"
 
 # System clipboard access
 arboard = "3"
+
+# PTY for integrated terminal
+nix = { version = "0.29", features = ["term", "process", "fs"] }
+libc = "0.2"

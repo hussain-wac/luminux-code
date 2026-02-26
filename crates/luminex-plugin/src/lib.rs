@@ -259,6 +259,7 @@ pub struct PluginManager {
     plugins: HashMap<String, PluginInfo>,
 
     /// Plugin context
+    #[allow(dead_code)]
     context: PluginContext,
 }
 

@@ -6,7 +6,6 @@
 //! complex subsystems. External code only needs to interact with
 //! `Editor`, not individual components.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use crate::command::CommandRegistry;
@@ -43,6 +42,7 @@ pub struct Editor {
     keymap: Keymap,
 
     /// Command registry
+    #[allow(dead_code)]
     commands: CommandRegistry,
 
     /// Event bus for notifications
