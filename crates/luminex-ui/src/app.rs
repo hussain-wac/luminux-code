@@ -303,6 +303,24 @@ pub struct App {
     editor_context_position: Point,
     /// Which top menu bar dropdown is currently open (None = all closed).
     active_menu: Option<TopMenu>,
+    /// Font size for the editor (zoom).
+    font_size: f32,
+    /// Whether the "Go to Line" dialog is visible.
+    goto_line_visible: bool,
+    /// Input text for the "Go to Line" dialog.
+    goto_line_input: String,
+    /// Whether the About modal is visible.
+    about_visible: bool,
+    /// Whether the integrated terminal is visible.
+    terminal_visible: bool,
+    /// Terminal output lines.
+    terminal_output: Vec<String>,
+    /// Terminal input buffer.
+    terminal_input: String,
+    /// Terminal working directory.
+    terminal_cwd: PathBuf,
+    /// Terminal height in pixels.
+    terminal_height: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +405,34 @@ pub enum Message {
     ToggleTopMenu(TopMenu),
     CloseTopMenu,
 
+    // Zoom
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+
+    // Go to Line
+    ShowGotoLine,
+    GotoLineInputChanged(String),
+    GotoLineConfirm,
+    GotoLineCancel,
+
+    // Selection
+    SelectLine,
+
+    // Window operations
+    CloseWindow,
+
+    // Help
+    ShowAbout,
+    HideAbout,
+
+    // Terminal
+    ToggleTerminal,
+    TerminalInputChanged(String),
+    TerminalSubmit,
+    TerminalOutput(String),
+    TerminalClear,
+
     // Async results
     FileOpened(Result<(PathBuf, String), String>),
     FolderOpened(Result<PathBuf, String>),
@@ -419,6 +465,15 @@ impl App {
             editor_context_visible: false,
             editor_context_position: Point::ORIGIN,
             active_menu: None,
+            font_size: 14.0,
+            goto_line_visible: false,
+            goto_line_input: String::new(),
+            about_visible: false,
+            terminal_visible: false,
+            terminal_output: vec!["Welcome to Luminex Terminal. Type commands and press Enter.".to_string()],
+            terminal_input: String::new(),
+            terminal_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            terminal_height: 200.0,
         };
 
         // Set initial content with sample Rust code
@@ -1150,6 +1205,9 @@ impl Config {
 
             Message::CloseTopMenu => {
                 self.active_menu = None;
+                self.editor_context_visible = false;
+                self.goto_line_visible = false;
+                self.about_visible = false;
             }
 
             // Editor context menu
@@ -1219,6 +1277,182 @@ impl Config {
                     tab.content.perform(text_editor::Action::SelectAll);
                     self.status_message = "Selected all".to_string();
                 }
+            }
+
+            // Zoom
+            Message::ZoomIn => {
+                self.active_menu = None;
+                self.font_size = (self.font_size + 2.0).min(40.0);
+                self.status_message = format!("Zoom: {}px", self.font_size);
+            }
+            Message::ZoomOut => {
+                self.active_menu = None;
+                self.font_size = (self.font_size - 2.0).max(8.0);
+                self.status_message = format!("Zoom: {}px", self.font_size);
+            }
+            Message::ZoomReset => {
+                self.active_menu = None;
+                self.font_size = 14.0;
+                self.status_message = "Zoom reset to 14px".to_string();
+            }
+
+            // Go to Line
+            Message::ShowGotoLine => {
+                self.active_menu = None;
+                self.goto_line_visible = true;
+                self.goto_line_input = String::new();
+            }
+            Message::GotoLineInputChanged(val) => {
+                self.goto_line_input = val;
+            }
+            Message::GotoLineConfirm => {
+                self.goto_line_visible = false;
+                if let Ok(line_num) = self.goto_line_input.trim().parse::<usize>() {
+                    if line_num > 0 {
+                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            // Move to document start first, then move down line_num-1 lines
+                            tab.content.perform(text_editor::Action::Move(
+                                text_editor::Motion::DocumentStart,
+                            ));
+                            for _ in 0..line_num.saturating_sub(1) {
+                                tab.content.perform(text_editor::Action::Move(
+                                    text_editor::Motion::Down,
+                                ));
+                            }
+                            self.status_message = format!("Go to line {}", line_num);
+                        }
+                    }
+                }
+            }
+            Message::GotoLineCancel => {
+                self.goto_line_visible = false;
+            }
+
+            // Select Line
+            Message::SelectLine => {
+                self.active_menu = None;
+                self.editor_context_visible = false;
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.content.perform(text_editor::Action::SelectLine);
+                    self.status_message = "Line selected".to_string();
+                }
+            }
+
+            // Window operations
+            Message::CloseWindow => {
+                self.active_menu = None;
+                return iced::exit();
+            }
+
+            // Help
+            Message::ShowAbout => {
+                self.active_menu = None;
+                self.about_visible = true;
+            }
+            Message::HideAbout => {
+                self.about_visible = false;
+            }
+
+            // Terminal
+            Message::ToggleTerminal => {
+                self.active_menu = None;
+                self.terminal_visible = !self.terminal_visible;
+                if self.terminal_visible {
+                    // Set terminal cwd to project folder if available
+                    if let Some(folder) = &self.current_folder {
+                        self.terminal_cwd = folder.clone();
+                    }
+                    self.status_message = "Terminal opened".to_string();
+                } else {
+                    self.status_message = "Terminal closed".to_string();
+                }
+            }
+            Message::TerminalInputChanged(val) => {
+                self.terminal_input = val;
+            }
+            Message::TerminalSubmit => {
+                let cmd = self.terminal_input.trim().to_string();
+                if cmd.is_empty() {
+                    return Task::none();
+                }
+                self.terminal_input.clear();
+
+                // Display the command
+                let prompt = format!("$ {}", cmd);
+                self.terminal_output.push(prompt);
+
+                // Handle built-in commands
+                if cmd == "clear" || cmd == "cls" {
+                    self.terminal_output.clear();
+                    return Task::none();
+                }
+
+                if cmd.starts_with("cd ") {
+                    let dir = cmd[3..].trim();
+                    let new_path = if dir.starts_with('/') {
+                        PathBuf::from(dir)
+                    } else if dir == "~" {
+                        std::env::var("HOME").map(PathBuf::from).unwrap_or(self.terminal_cwd.clone())
+                    } else {
+                        self.terminal_cwd.join(dir)
+                    };
+                    if new_path.is_dir() {
+                        self.terminal_cwd = new_path.canonicalize().unwrap_or(new_path);
+                    } else {
+                        self.terminal_output.push(format!("cd: {}: No such directory", dir));
+                    }
+                    return Task::none();
+                }
+
+                // Execute external command
+                let cwd = self.terminal_cwd.clone();
+                return Task::perform(
+                    async move {
+                        let output = tokio::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&cmd)
+                            .current_dir(&cwd)
+                            .output()
+                            .await;
+
+                        match output {
+                            Ok(out) => {
+                                let mut result = String::new();
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                if !stdout.is_empty() {
+                                    result.push_str(&stdout);
+                                }
+                                if !stderr.is_empty() {
+                                    if !result.is_empty() {
+                                        result.push('\n');
+                                    }
+                                    result.push_str(&stderr);
+                                }
+                                if result.is_empty() {
+                                    result = "(no output)".to_string();
+                                }
+                                result
+                            }
+                            Err(e) => format!("Error: {}", e),
+                        }
+                    },
+                    Message::TerminalOutput,
+                );
+            }
+            Message::TerminalOutput(output) => {
+                // Split output into lines and add to terminal
+                for line in output.lines() {
+                    self.terminal_output.push(line.to_string());
+                }
+                // Limit terminal output buffer
+                if self.terminal_output.len() > 1000 {
+                    let drain_count = self.terminal_output.len() - 1000;
+                    self.terminal_output.drain(0..drain_count);
+                }
+            }
+            Message::TerminalClear => {
+                self.terminal_output.clear();
             }
 
         }
@@ -1302,10 +1536,16 @@ impl Config {
                             if modifiers.shift() {
                                 return Some(Message::Redo);
                             } else {
-                                return Some(Message::UndoExplorerDelete);
+                                return Some(Message::Undo);
                             }
                         }
                         "y" => return Some(Message::Redo),
+                        "g" => return Some(Message::ShowGotoLine),
+                        "q" => return Some(Message::CloseWindow),
+                        "=" | "+" => return Some(Message::ZoomIn),
+                        "-" => return Some(Message::ZoomOut),
+                        "0" => return Some(Message::ZoomReset),
+                        "`" => return Some(Message::ToggleTerminal),
                         _ => {}
                     }
                 }
@@ -1319,6 +1559,12 @@ impl Config {
                     }
                 }
             }
+
+            // Escape to close modals/menus
+            if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                return Some(Message::CloseTopMenu);
+            }
+
             None
         })
     }
@@ -1411,6 +1657,51 @@ impl Config {
                 .on_press(Message::HideContextMenu),
                 tracked_view,
                 self.view_context_menu(),
+            ]
+            .into()
+        } else if self.editor_context_visible {
+            stack![
+                // Click-away layer to close editor context menu
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                )
+                .on_press(Message::HideEditorContextMenu),
+                tracked_view,
+                self.view_editor_context_menu(),
+            ]
+            .into()
+        } else if self.goto_line_visible {
+            stack![
+                tracked_view,
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
+                            ..Default::default()
+                        })
+                )
+                .on_press(Message::GotoLineCancel),
+                self.view_goto_line_modal(),
+            ]
+            .into()
+        } else if self.about_visible {
+            stack![
+                tracked_view,
+                mouse_area(
+                    container(Space::new(Length::Fill, Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
+                            ..Default::default()
+                        })
+                )
+                .on_press(Message::HideAbout),
+                self.view_about_modal(),
             ]
             .into()
         } else if self.active_menu.is_some() {
@@ -1775,6 +2066,138 @@ impl Config {
         .into()
     }
 
+    fn view_goto_line_modal(&self) -> Element<'_, Message> {
+        let modal_content = column![
+            text("Go to Line").size(16).color(colors::TEXT_PRIMARY),
+            Space::with_height(12),
+            text_input("Line number...", &self.goto_line_input)
+                .on_input(Message::GotoLineInputChanged)
+                .on_submit(Message::GotoLineConfirm)
+                .padding(Padding::from([8, 12]))
+                .size(13),
+            Space::with_height(16),
+            row![
+                button(
+                    text("Cancel").size(13).color(colors::TEXT_PRIMARY)
+                )
+                .padding(Padding::from([8, 20]))
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => colors::BG_HOVER,
+                        _ => colors::BG_LIGHT,
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: colors::TEXT_PRIMARY,
+                        border: Border {
+                            color: colors::BORDER,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::GotoLineCancel),
+                Space::with_width(12),
+                button(
+                    text("Go").size(13).color(Color::WHITE)
+                )
+                .padding(Padding::from([8, 20]))
+                .style(|_: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => Color::from_rgb(0.40, 0.58, 0.95),
+                        _ => colors::ACCENT,
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: Color::WHITE,
+                        border: Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+                .on_press(Message::GotoLineConfirm),
+            ]
+            .align_y(iced::Alignment::Center),
+        ]
+        .padding(24)
+        .width(Length::Fixed(320.0));
+
+        container(
+            container(modal_content)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(colors::BG_MEDIUM)),
+                    border: Border {
+                        color: colors::BORDER,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                })
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    }
+
+    fn view_about_modal(&self) -> Element<'_, Message> {
+        let modal_content = column![
+            text("Luminex").size(20).color(colors::ACCENT),
+            Space::with_height(8),
+            text("A modern text editor built with Rust & Iced")
+                .size(13)
+                .color(colors::TEXT_SECONDARY),
+            Space::with_height(12),
+            text("Version 0.1.0").size(12).color(colors::TEXT_MUTED),
+            Space::with_height(20),
+            button(
+                text("Close").size(13).color(Color::WHITE)
+            )
+            .padding(Padding::from([8, 24]))
+            .style(|_: &Theme, status: button::Status| {
+                let bg = match status {
+                    button::Status::Hovered => Color::from_rgb(0.40, 0.58, 0.95),
+                    _ => colors::ACCENT,
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .on_press(Message::HideAbout),
+        ]
+        .padding(24)
+        .width(Length::Fixed(340.0))
+        .align_x(iced::Alignment::Center);
+
+        container(
+            container(modal_content)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(colors::BG_MEDIUM)),
+                    border: Border {
+                        color: colors::BORDER,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                })
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    }
+
     // ========================================================================
     // Menu Bar (Zed-style top menu)
     // ========================================================================
@@ -1888,27 +2311,6 @@ impl Config {
     }
 
     /// Build a disabled menu item (grayed out, no action).
-    fn menu_item_disabled<'a>(label: &'a str, shortcut: &'a str) -> Element<'a, Message> {
-        button(
-            row![
-                text(label).size(12).color(colors::TEXT_MUTED),
-                horizontal_space(),
-                text(shortcut).size(11).color(colors::TEXT_MUTED),
-            ]
-            .width(Length::Fill)
-            .align_y(iced::Alignment::Center),
-        )
-        .width(Length::Fill)
-        .padding(Padding::from([6, 16]))
-        .style(|_: &Theme, _status: button::Status| button::Style {
-            background: Some(Background::Color(Color::TRANSPARENT)),
-            text_color: colors::TEXT_MUTED,
-            border: Border::default(),
-            ..Default::default()
-        })
-        .into()
-    }
-
     fn menu_separator<'a>() -> Element<'a, Message> {
         container(Space::new(Length::Fill, 1))
             .padding(Padding::from([4, 8]))
@@ -1940,7 +2342,7 @@ impl Config {
                 items.push(Self::menu_item("Close Tab", "Ctrl+W", Message::CloseCurrentTab));
             }
             TopMenu::Edit => {
-                items.push(Self::menu_item("Undo", "Ctrl+Z", Message::UndoExplorerDelete));
+                items.push(Self::menu_item("Undo", "Ctrl+Z", Message::Undo));
                 items.push(Self::menu_item("Redo", "Ctrl+Y", Message::Redo));
                 items.push(Self::menu_separator());
                 items.push(Self::menu_item("Cut", "Ctrl+X", Message::EditorCut));
@@ -1951,40 +2353,28 @@ impl Config {
             }
             TopMenu::Selection => {
                 items.push(Self::menu_item("Select All", "Ctrl+A", Message::EditorSelectAll));
-                items.push(Self::menu_separator());
-                items.push(Self::menu_item_disabled("Expand Selection", ""));
-                items.push(Self::menu_item_disabled("Shrink Selection", ""));
-                items.push(Self::menu_separator());
-                items.push(Self::menu_item_disabled("Add Cursor Above", ""));
-                items.push(Self::menu_item_disabled("Add Cursor Below", ""));
+                items.push(Self::menu_item("Select Line", "", Message::SelectLine));
             }
             TopMenu::View => {
                 items.push(Self::menu_item("Toggle Sidebar", "", Message::ToggleSidebar));
                 items.push(Self::menu_item("Toggle Minimap", "", Message::ToggleMinimap));
+                items.push(Self::menu_item("Toggle Terminal", "Ctrl+`", Message::ToggleTerminal));
                 items.push(Self::menu_separator());
-                items.push(Self::menu_item_disabled("Zoom In", "Ctrl+="));
-                items.push(Self::menu_item_disabled("Zoom Out", "Ctrl+-"));
-                items.push(Self::menu_item_disabled("Reset Zoom", "Ctrl+0"));
+                items.push(Self::menu_item("Zoom In", "Ctrl+=", Message::ZoomIn));
+                items.push(Self::menu_item("Zoom Out", "Ctrl+-", Message::ZoomOut));
+                items.push(Self::menu_item("Reset Zoom", "Ctrl+0", Message::ZoomReset));
             }
             TopMenu::Go => {
-                items.push(Self::menu_item_disabled("Go to File...", "Ctrl+P"));
-                items.push(Self::menu_item_disabled("Go to Line...", "Ctrl+G"));
-                items.push(Self::menu_item_disabled("Go to Symbol...", "Ctrl+Shift+O"));
+                items.push(Self::menu_item("Go to Line...", "Ctrl+G", Message::ShowGotoLine));
                 items.push(Self::menu_separator());
                 items.push(Self::menu_item("Next Tab", "Ctrl+Tab", Message::NextTab));
                 items.push(Self::menu_item("Previous Tab", "Ctrl+Shift+Tab", Message::PrevTab));
             }
             TopMenu::Window => {
-                items.push(Self::menu_item_disabled("New Window", ""));
-                items.push(Self::menu_separator());
-                items.push(Self::menu_item_disabled("Minimize", ""));
-                items.push(Self::menu_item_disabled("Maximize", ""));
+                items.push(Self::menu_item("Close Window", "Ctrl+Q", Message::CloseWindow));
             }
             TopMenu::Help => {
-                items.push(Self::menu_item_disabled("Welcome", ""));
-                items.push(Self::menu_item_disabled("Documentation", ""));
-                items.push(Self::menu_separator());
-                items.push(Self::menu_item_disabled("About Luminex", ""));
+                items.push(Self::menu_item("About Luminex", "", Message::ShowAbout));
             }
         }
 
@@ -2236,7 +2626,31 @@ impl Config {
     // ========================================================================
 
     fn view_main_area(&self) -> Element<'_, Message> {
-        column![self.view_tabs(), self.view_editor(),]
+        let mut editor_row_items: Vec<Element<'_, Message>> = vec![self.view_editor()];
+
+        // Add minimap if visible
+        if self.minimap_visible {
+            editor_row_items.push(self.view_minimap());
+        }
+
+        // Add scrollbar indicator
+        editor_row_items.push(self.view_scrollbar());
+
+        let editor_with_minimap = Row::with_children(editor_row_items)
+            .height(Length::Fill);
+
+        let mut main_items: Vec<Element<'_, Message>> = vec![
+            self.view_tabs(),
+            editor_with_minimap.into(),
+        ];
+
+        // Add terminal if visible
+        if self.terminal_visible {
+            main_items.push(self.view_terminal_divider());
+            main_items.push(self.view_terminal());
+        }
+
+        Column::with_children(main_items)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -2352,11 +2766,33 @@ impl Config {
                 language: tab.language.clone(),
             };
 
+            // Selection color: bright blue normally, dimmed when context menu is open
+            let context_open = self.editor_context_visible;
+            let selection_color = if context_open {
+                Color::from_rgba(0.30, 0.45, 0.75, 0.35)
+            } else {
+                Color::from_rgba(0.25, 0.46, 0.85, 0.55)
+            };
+
             let editor = text_editor(&tab.content)
                 .height(Length::Fill)
                 .padding(16)
                 .font(Font::MONOSPACE)
-                .size(14)
+                .size(self.font_size)
+                .style(move |_theme: &Theme, _status| {
+                    text_editor::Style {
+                        background: Background::Color(colors::BG_DARK),
+                        border: Border {
+                            width: 0.0,
+                            radius: 0.0.into(),
+                            color: Color::TRANSPARENT,
+                        },
+                        icon: colors::TEXT_MUTED,
+                        placeholder: colors::TEXT_MUTED,
+                        value: colors::TEXT_PRIMARY,
+                        selection: selection_color,
+                    }
+                })
                 .highlight_with::<EditorHighlighter>(highlight_settings, |highlight, _theme| {
                     highlight.to_format(Font::MONOSPACE)
                 })
@@ -2365,10 +2801,6 @@ impl Config {
             let editor_container: Element<'_, Message> = container(editor)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(Background::Color(colors::BG_DARK)),
-                    ..Default::default()
-                })
                 .into();
 
             // Wrap in mouse_area for right-click context menu
@@ -2387,6 +2819,296 @@ impl Config {
                 })
                 .into()
         }
+    }
+
+    // ========================================================================
+    // Scrollbar
+    // ========================================================================
+
+    fn view_scrollbar(&self) -> Element<'_, Message> {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let total_lines = tab.content.line_count().max(1);
+            let (cursor_line, _) = tab.content.cursor_position();
+
+            // Estimate visible lines based on font size (approximate)
+            let visible_lines = (400.0 / (self.font_size * 1.4)) as usize;
+            let visible_lines = visible_lines.max(10);
+
+            // Calculate thumb size and position
+            let thumb_ratio = (visible_lines as f32 / total_lines as f32).min(1.0);
+            let scroll_ratio = if total_lines > visible_lines {
+                cursor_line as f32 / (total_lines - 1).max(1) as f32
+            } else {
+                0.0
+            };
+
+            let thumb_height_pct = (thumb_ratio * 100.0).max(8.0).min(100.0);
+            let thumb_top_pct = (scroll_ratio * (100.0 - thumb_height_pct)).max(0.0);
+
+            // Build the scrollbar track with thumb
+            let track: Element<'_, Message> = container(
+                column![
+                    Space::with_height(Length::FillPortion((thumb_top_pct * 100.0) as u16 + 1)),
+                    container(Space::new(Length::Fill, Length::FillPortion((thumb_height_pct * 100.0) as u16 + 1)))
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.15))),
+                            border: Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    Space::with_height(Length::FillPortion(((100.0 - thumb_top_pct - thumb_height_pct) * 100.0) as u16 + 1)),
+                ]
+                .height(Length::Fill)
+            )
+            .width(Length::Fixed(12.0))
+            .height(Length::Fill)
+            .padding(Padding::from([2, 2]))
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BG_MEDIUM)),
+                ..Default::default()
+            })
+            .into();
+
+            track
+        } else {
+            // No file open, empty scrollbar area
+            container(Space::new(12, Length::Fill))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(colors::BG_MEDIUM)),
+                    ..Default::default()
+                })
+                .into()
+        }
+    }
+
+    // ========================================================================
+    // Minimap
+    // ========================================================================
+
+    fn view_minimap(&self) -> Element<'_, Message> {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let total_lines = tab.content.line_count();
+            let (cursor_line, _) = tab.content.cursor_position();
+
+            // Build minimap lines - show a compressed view of the code
+            let max_minimap_lines = 200;
+            let lines_to_show = total_lines.min(max_minimap_lines);
+
+            let mut minimap_items: Vec<Element<'_, Message>> = Vec::new();
+
+            for i in 0..lines_to_show {
+                // Sample lines if there are too many
+                let line_idx = if total_lines <= max_minimap_lines {
+                    i
+                } else {
+                    (i as f64 * total_lines as f64 / max_minimap_lines as f64) as usize
+                };
+
+                let line_text = tab.content.line(line_idx)
+                    .map(|l| {
+                        let s: &str = &l;
+                        s.to_string()
+                    })
+                    .unwrap_or_default();
+
+                // Create a visual representation of the line
+                let line_len = line_text.trim_end().len().min(80);
+                let indent = line_text.len() - line_text.trim_start().len();
+                let indent = indent.min(40);
+                let content_len = if line_len > indent { line_len - indent } else { 0 };
+
+                let is_current = line_idx == cursor_line;
+                let alpha = if is_current { 0.8 } else { 0.25 };
+                let line_color = if is_current {
+                    Color::from_rgba(0.36, 0.54, 0.90, 0.6)
+                } else {
+                    Color::from_rgba(0.7, 0.7, 0.7, alpha)
+                };
+
+                let minimap_line: Element<'_, Message> = row![
+                    Space::with_width(Length::Fixed(indent as f32 * 0.8)),
+                    container(Space::new(Length::Fixed((content_len as f32 * 0.8).max(1.0)), 2))
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(line_color)),
+                            ..Default::default()
+                        }),
+                ]
+                .into();
+
+                minimap_items.push(minimap_line);
+            }
+
+            // Viewport indicator
+            let minimap_content = Column::with_children(minimap_items)
+                .spacing(0)
+                .width(Length::Fill);
+
+            container(
+                scrollable(minimap_content)
+                    .height(Length::Fill)
+            )
+            .width(Length::Fixed(80.0))
+            .height(Length::Fill)
+            .padding(Padding::from([4, 4]))
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.14))),
+                border: Border {
+                    color: colors::BORDER,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            Space::new(0, 0).into()
+        }
+    }
+
+    // ========================================================================
+    // Terminal
+    // ========================================================================
+
+    fn view_terminal_divider(&self) -> Element<'_, Message> {
+        container(Space::new(Length::Fill, 1))
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(colors::BORDER)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_terminal(&self) -> Element<'_, Message> {
+        // Terminal header
+        let header = container(
+            row![
+                text("TERMINAL").size(11).color(colors::TEXT_SECONDARY).font(Font::MONOSPACE),
+                horizontal_space(),
+                text(self.terminal_cwd.display().to_string())
+                    .size(10)
+                    .color(colors::TEXT_MUTED)
+                    .font(Font::MONOSPACE),
+                Space::with_width(8),
+                button(text("Clear").size(10).color(colors::TEXT_SECONDARY).font(Font::MONOSPACE))
+                    .padding(Padding::from([2, 8]))
+                    .style(|_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered => colors::BG_HOVER,
+                            _ => Color::TRANSPARENT,
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: colors::TEXT_SECONDARY,
+                            border: Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::TerminalClear),
+                Space::with_width(4),
+                button(text("x").size(11).color(colors::TEXT_MUTED))
+                    .padding(Padding::from([2, 6]))
+                    .style(|_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered => colors::BG_HOVER,
+                            _ => Color::TRANSPARENT,
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: colors::TEXT_PRIMARY,
+                            border: Border {
+                                radius: 2.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::ToggleTerminal),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(Padding::from([6, 12]))
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.10, 0.10, 0.12))),
+            ..Default::default()
+        });
+
+        // Terminal output
+        let mut output_items: Vec<Element<'_, Message>> = Vec::new();
+        for line in &self.terminal_output {
+            let line_color = if line.starts_with("$ ") {
+                colors::ACCENT
+            } else if line.starts_with("Error:") || line.starts_with("error") {
+                Color::from_rgb(0.90, 0.35, 0.35)
+            } else {
+                colors::TEXT_SECONDARY
+            };
+            output_items.push(
+                text(line).size(12).font(Font::MONOSPACE).color(line_color).into()
+            );
+        }
+
+        let output_column = Column::with_children(output_items)
+            .spacing(1)
+            .width(Length::Fill);
+
+        let output_scroll = scrollable(output_column)
+            .height(Length::Fill);
+
+        // Terminal input line
+        let prompt_display: String = format!("{}$", self.terminal_cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string()));
+
+        let input_line = row![
+            text(prompt_display).size(12).font(Font::MONOSPACE).color(colors::ACCENT),
+            Space::with_width(6),
+            text_input("Type a command...", &self.terminal_input)
+                .on_input(Message::TerminalInputChanged)
+                .on_submit(Message::TerminalSubmit)
+                .padding(Padding::from([4, 8]))
+                .size(12)
+                .font(Font::MONOSPACE),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(0);
+
+        let terminal_content = column![
+            header,
+            container(output_scroll)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Padding::from([4, 12])),
+            container(input_line)
+                .width(Length::Fill)
+                .padding(Padding::from([6, 12]))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::from_rgb(0.09, 0.09, 0.11))),
+                    border: Border {
+                        color: colors::BORDER,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..Default::default()
+                }),
+        ];
+
+        container(terminal_content)
+            .width(Length::Fill)
+            .height(Length::Fixed(self.terminal_height))
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.08, 0.08, 0.10))),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn editor_menu_btn<'a>(label: &'a str, shortcut: &'a str, msg: Message, enabled: bool) -> Element<'a, Message> {
@@ -2441,7 +3163,7 @@ impl Config {
         let mut items: Vec<Element<'_, Message>> = Vec::new();
 
         // Undo / Redo
-        items.push(Self::editor_menu_btn("Undo", "Ctrl+Z", Message::UndoExplorerDelete, true));
+        items.push(Self::editor_menu_btn("Undo", "Ctrl+Z", Message::Undo, true));
         items.push(Self::editor_menu_btn("Redo", "Ctrl+Y", Message::Redo, true));
         items.push(Self::editor_menu_separator());
 
