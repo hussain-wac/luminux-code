@@ -681,6 +681,9 @@ impl App {
                 self.editor_context_visible = true;
                 self.editor_context_position = self.last_cursor_position;
                 self.context_menu.visible = false;
+                // Re-focus the text editor so selection highlight is preserved
+                // when the context menu overlay changes the widget tree.
+                return iced::widget::focus_next();
             }
 
             Message::HideEditorContextMenu => {
