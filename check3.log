@@ -1,0 +1,26 @@
+    Checking luminex-ui v0.1.0 (C:\Users\l7cre\Desktop\luminux-code\crates\luminex-ui)
+warning: unused import: `Path`
+ --> crates\luminex-ui\src\app\mod.rs:3:17
+  |
+3 | use std::path::{Path, PathBuf};
+  |                 ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `TopMenu`
+ --> crates\luminex-ui\src\app\update.rs:4:60
+  |
+4 | use super::{App, Message, TabInfo, FileNode, DeletedEntry, TopMenu};
+  |                                                            ^^^^^^^
+
+warning: unused import: `std::path::PathBuf`
+ --> crates\luminex-ui\src\app\view\mod.rs:9:5
+  |
+9 | use std::path::PathBuf;
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: `luminex-ui` (lib) generated 3 warnings (run `cargo fix --lib -p luminex-ui` to apply 3 suggestions)
+    Checking luminex v0.1.0 (C:\Users\l7cre\Desktop\luminux-code)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.74s
+warning: the following packages contain code that will be rejected by a future version of Rust: net2 v0.2.39
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

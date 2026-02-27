@@ -150,21 +150,23 @@ impl App {
                 language: tab.language.clone(),
             };
 
-            let context_open = self.editor_context_visible;
-            let selection_color = if context_open {
-                Color::from_rgba(0.30, 0.45, 0.75, 0.35)
-            } else {
-                Color::from_rgba(0.25, 0.46, 0.85, 0.55)
-            };
-
             let editor_bg = colors::BG_DARK;
+            let selection_color = Color::from_rgba(0.25, 0.46, 0.85, 0.55);
 
+            // Use text_editor's native scroll — do NOT wrap in scrollable().
+            // Wrapping resets the scroll position on every re-render (e.g. right-click).
             let editor = text_editor(&tab.content)
                 .height(Length::Fill)
-                .padding(16)
+                .padding(iced::Padding { top: 16.0, right: 20.0, bottom: 16.0, left: 16.0 })
                 .font(Font::MONOSPACE)
                 .size(self.font_size)
-                .style(move |_theme: &Theme, _status| {
+                .style(move |_theme: &Theme, status| {
+                    let _scrollbar_color = match status {
+                        text_editor::Status::Focused =>
+                            Color::from_rgba(0.5, 0.5, 0.5, 0.7),
+                        _ =>
+                            Color::from_rgba(0.4, 0.4, 0.4, 0.4),
+                    };
                     text_editor::Style {
                         background: Background::Color(editor_bg),
                         border: Border {
@@ -183,15 +185,9 @@ impl App {
                 })
                 .on_action(Message::EditorAction);
 
-            let editor_container = scrollable(container(editor)
-                .width(Length::Fill)
-                .height(Length::Shrink))
-                .height(Length::Fill)
-                .width(Length::Fill);
-
-            let editor_element: Element<'_, Message> = editor_container.into();
-
-            mouse_area(editor_element)
+            // mouse_area wraps the editor so that right-click is captured WITHOUT
+            // triggering an EditorAction (which would reset scroll).
+            mouse_area(editor)
                 .on_right_press(Message::ShowEditorContextMenu)
                 .into()
         } else {

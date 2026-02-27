@@ -38,6 +38,7 @@ impl App {
 
         let tracked_view: Element<'_, Message> = mouse_area(main_view)
             .on_move(Message::MouseMoved)
+            .on_release(Message::StopTerminalResize)
             .into();
 
         if self.confirm_delete_visible {

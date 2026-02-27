@@ -44,6 +44,7 @@ pub struct App {
     pub diagnostics_messages: Vec<String>,
     pub terminal_visible: bool,
     pub terminal_height: f32,
+    pub is_resizing_terminal: bool,
     pub terminal_focused: bool,
     pub terminal: iced_term::Terminal,
 }
@@ -83,6 +84,7 @@ impl App {
             diagnostics_messages: Vec::new(),
             terminal_visible: false,
             terminal_height: 250.0,
+            is_resizing_terminal: false,
             terminal_focused: false,
             terminal: iced_term::Terminal::new(0, iced_term::settings::Settings {
                 backend: iced_term::settings::BackendSettings {

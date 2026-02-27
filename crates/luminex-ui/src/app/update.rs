@@ -382,8 +382,20 @@ impl App {
                 }
             }
 
-            Message::MouseMoved(point) => {
-                self.last_cursor_position = point;
+            Message::MouseMoved(p) => {
+                if self.is_resizing_terminal {
+                    let delta_y = self.last_cursor_position.y - p.y;
+                    self.terminal_height = (self.terminal_height + delta_y).clamp(50.0, 800.0);
+                }
+                self.last_cursor_position = p;
+            }
+
+            Message::StartTerminalResize => {
+                self.is_resizing_terminal = true;
+            }
+
+            Message::StopTerminalResize => {
+                self.is_resizing_terminal = false;
             }
 
             Message::ShowContextMenu(_position, target, is_directory) => {

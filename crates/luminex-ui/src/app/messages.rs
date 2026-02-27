@@ -113,6 +113,8 @@ pub enum Message {
     TerminalEvent(iced_term::Event),
     TerminalClear,
     TerminalFocused,
+    StartTerminalResize,
+    StopTerminalResize,
     KeyPressed(keyboard::Key, keyboard::Modifiers),
 
     // Async results

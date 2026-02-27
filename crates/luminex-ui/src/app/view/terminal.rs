@@ -182,6 +182,7 @@ impl App {
 
         let term_view = iced_term::TerminalView::show(&self.terminal)
             .map(Message::TerminalEvent);
+        let filtered_term = FocusFilter::new(term_view, self.terminal_focused);
 
         let focus_border_color = if self.terminal_focused {
             Color::from_rgb(0.25, 0.55, 0.95)
@@ -189,8 +190,20 @@ impl App {
             Color::TRANSPARENT
         };
 
-        let term_element: Element<'_, Message> = term_view.into();
+        let term_element: Element<'_, Message> = filtered_term.into();
+
+        let resize_handle = mouse_area(
+            container(Space::new(Length::Fill, 4))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.05))),
+                    ..Default::default()
+                })
+        )
+        .on_press(Message::StartTerminalResize)
+        .interaction(iced::mouse::Interaction::ResizingVertically);
+
         let terminal_content = Column::new()
+            .push(resize_handle)
             .push(header)
             .push(
                 container(term_element)
@@ -274,5 +287,150 @@ impl App {
                 ..Default::default()
             })
             .into()
+    }
+}
+
+struct FocusFilter<'a, Message, Theme, Renderer> {
+    content: Element<'a, Message, Theme, Renderer>,
+    is_focused: bool,
+}
+
+impl<'a, Message, Theme, Renderer> FocusFilter<'a, Message, Theme, Renderer> {
+    pub fn new(content: impl Into<Element<'a, Message, Theme, Renderer>>, is_focused: bool) -> Self {
+        Self {
+            content: content.into(),
+            is_focused,
+        }
+    }
+}
+
+impl<'a, Message, Theme, Renderer> iced::advanced::Widget<Message, Theme, Renderer>
+    for FocusFilter<'a, Message, Theme, Renderer>
+where
+    Renderer: iced::advanced::Renderer,
+{
+    fn size(&self) -> iced::Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &self,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        self.content.as_widget().layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        )
+    }
+
+    fn children(&self) -> Vec<iced::advanced::widget::Tree> {
+        vec![iced::advanced::widget::Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut iced::advanced::widget::Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content))
+    }
+
+    fn operate(
+        &self,
+        tree: &mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn iced::advanced::widget::operation::Operation,
+    ) {
+        self.content.as_widget().operate(&mut tree.children[0], layout, renderer, operation)
+    }
+
+    fn on_event(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &iced::Rectangle,
+    ) -> iced::event::Status {
+        if let iced::Event::Keyboard(_) = event {
+            if !self.is_focused {
+                return iced::event::Status::Ignored;
+            }
+        }
+
+        self.content.as_widget_mut().on_event(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        )
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::advanced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &Renderer,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            translation,
+        )
+    }
+}
+
+impl<'a, Message, Theme, Renderer> From<FocusFilter<'a, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: iced::advanced::Renderer + 'a,
+{
+    fn from(filter: FocusFilter<'a, Message, Theme, Renderer>) -> Self {
+        Element::new(filter)
     }
 }
