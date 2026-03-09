@@ -1,4 +1,4 @@
-use iced::{Point, Task, Subscription, keyboard};
+use iced::{Point, Task, Subscription, keyboard, mouse, Event};
 use iced::widget::text_editor;
 use std::path::{Path, PathBuf};
 
@@ -141,8 +141,21 @@ impl App {
             Some(Message::KeyPressed(key, modifiers))
         });
 
+        let mouse_sub = iced::event::listen_with(|event, _status, _id| {
+            match event {
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    Some(Message::StopTerminalResize)
+                }
+                Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Some(Message::MouseMoved(position))
+                }
+                _ => None,
+            }
+        });
+
         Subscription::batch([
             keyboard_sub,
+            mouse_sub,
             iced::Subscription::run_with_id(
                 self.terminal.id,
                 self.terminal.subscription(),

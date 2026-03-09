@@ -182,7 +182,8 @@ impl App {
 
         let term_view = iced_term::TerminalView::show(&self.terminal)
             .map(Message::TerminalEvent);
-        let filtered_term = FocusFilter::new(term_view, self.terminal_focused);
+        let filtered_term = FocusFilter::new(term_view, self.terminal_focused)
+            .on_press(Message::TerminalFocused);
 
         let focus_border_color = if self.terminal_focused {
             Color::from_rgb(0.25, 0.55, 0.95)
@@ -226,9 +227,7 @@ impl App {
                 ..Default::default()
             });
 
-        mouse_area(terminal_container)
-            .on_press(Message::TerminalFocused)
-            .into()
+        terminal_container.into()
     }
 
     pub fn view_status_bar(&self) -> Element<'_, Message> {
@@ -293,18 +292,25 @@ impl App {
 struct FocusFilter<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     is_focused: bool,
+    on_press: Option<Message>,
 }
 
-impl<'a, Message, Theme, Renderer> FocusFilter<'a, Message, Theme, Renderer> {
+impl<'a, Message: Clone, Theme, Renderer> FocusFilter<'a, Message, Theme, Renderer> {
     pub fn new(content: impl Into<Element<'a, Message, Theme, Renderer>>, is_focused: bool) -> Self {
         Self {
             content: content.into(),
             is_focused,
+            on_press: None,
         }
+    }
+
+    pub fn on_press(mut self, message: Message) -> Self {
+        self.on_press = Some(message);
+        self
     }
 }
 
-impl<'a, Message, Theme, Renderer> iced::advanced::Widget<Message, Theme, Renderer>
+impl<'a, Message: Clone, Theme, Renderer> iced::advanced::Widget<Message, Theme, Renderer>
     for FocusFilter<'a, Message, Theme, Renderer>
 where
     Renderer: iced::advanced::Renderer,
@@ -378,6 +384,14 @@ where
             }
         }
 
+        if let iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) = event {
+            if cursor.is_over(layout.bounds()) {
+                if let Some(msg) = &self.on_press {
+                    shell.publish(msg.clone());
+                }
+            }
+        }
+
         self.content.as_widget_mut().on_event(
             &mut tree.children[0],
             event,
@@ -423,7 +437,7 @@ where
     }
 }
 
-impl<'a, Message, Theme, Renderer> From<FocusFilter<'a, Message, Theme, Renderer>>
+impl<'a, Message: Clone, Theme, Renderer> From<FocusFilter<'a, Message, Theme, Renderer>>
     for Element<'a, Message, Theme, Renderer>
 where
     Message: 'a,
